@@ -1,0 +1,9 @@
+# Browser profile / cached data (NEVER commit)
+.browser_profile/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+
+# Generated outputs
+outputs/
