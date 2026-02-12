@@ -126,15 +126,78 @@ def wait_for_response(page, timeout=S.RESPONSE_TIMEOUT):
 
 
 def extract_last_response(page) -> str:
-    """Get the text of the last assistant message."""
+    """Get the text of the last assistant message.
+    
+    Strategy: inner_text() loses code fences (``` markers), so we
+    reconstruct them by finding <pre><code> blocks in the DOM and
+    wrapping their content with proper markdown fences before
+    returning the combined text.
+    """
     for sel in S.ASSISTANT_MESSAGE_SELECTORS:
         messages = page.query_selector_all(sel)
-        if messages:
-            last_msg = messages[-1]
-            # Get inner text (strips HTML)
-            text = last_msg.inner_text()
-            return text.strip()
-    
+        if not messages:
+            continue
+
+        last_msg = messages[-1]
+
+        # --- Extract code blocks from DOM first ---
+        code_blocks = []  # list of (language, code_text)
+        pre_elements = last_msg.query_selector_all("pre")
+        for pre in pre_elements:
+            code_el = pre.query_selector("code")
+            if code_el:
+                # ChatGPT puts language in class like "language-python"
+                classes = code_el.get_attribute("class") or ""
+                lang = ""
+                for cls in classes.split():
+                    if cls.startswith("language-"):
+                        lang = cls.replace("language-", "")
+                        break
+                    elif cls.startswith("lang-"):
+                        lang = cls.replace("lang-", "")
+                        break
+                code_text = code_el.inner_text()
+                code_blocks.append((lang, code_text))
+
+        # --- Get the full text ---
+        full_text = last_msg.inner_text()
+
+        # --- Replace the mangled code sections with proper fenced blocks ---
+        # inner_text() turns <pre><code> into something like:
+        #   python
+        #   Copy code
+        #   def hello():
+        #       ...
+        # We find these and replace with fenced versions.
+        for lang, code_text in code_blocks:
+            # Build the mangled pattern that inner_text() produces
+            # Try several variants ChatGPT uses
+            mangled_variants = []
+            clean_code = code_text.strip()
+
+            if lang:
+                mangled_variants.append(f"{lang}\nCopy code\n{clean_code}")
+                mangled_variants.append(f"{lang}\n Copy code\n{clean_code}")
+                mangled_variants.append(f"{lang}\nCopy\n{clean_code}")
+                mangled_variants.append(f"{lang}\n{clean_code}")
+
+            # The proper fenced replacement
+            fenced = f"```{lang}\n{clean_code}\n```"
+
+            replaced = False
+            for mangled in mangled_variants:
+                if mangled in full_text:
+                    full_text = full_text.replace(mangled, fenced, 1)
+                    replaced = True
+                    break
+
+            if not replaced:
+                # Fallback: just append fenced block if we can't find the mangled version
+                # (better to have duplicate than lose code)
+                full_text += f"\n\n{fenced}\n"
+
+        return full_text.strip()
+
     return "[ERROR] Could not extract response"
 
 
