@@ -25,12 +25,14 @@ import selectors as S
 
 # --- Config ---
 PROFILE_DIR = Path(__file__).parent / ".browser_profile"
-OUTPUT_DIR = Path(__file__).parent / "outputs"
+RAW_MD_DIR = Path(__file__).parent / "raw_md"
+GENERATED_DIR = Path(__file__).parent / "generated"
 
 
 def ensure_dirs():
     PROFILE_DIR.mkdir(exist_ok=True)
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    RAW_MD_DIR.mkdir(exist_ok=True)
+    GENERATED_DIR.mkdir(exist_ok=True)
 
 
 def launch_browser(pw, headed=True):
@@ -202,11 +204,11 @@ def extract_last_response(page) -> str:
 
 
 def save_response(prompt: str, response: str) -> Path:
-    """Save prompt/response pair as a timestamped markdown file."""
+    """Save prompt/response pair as a timestamped markdown file in raw_md/."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     slug = prompt[:40].replace(" ", "_").replace("/", "_")
     filename = f"{ts}_{slug}.md"
-    filepath = OUTPUT_DIR / filename
+    filepath = RAW_MD_DIR / filename
     
     content = f"""# ChatGPT Response
 **Timestamp**: {datetime.now().isoformat()}  
@@ -219,7 +221,7 @@ def save_response(prompt: str, response: str) -> Path:
 {response}
 """
     filepath.write_text(content, encoding="utf-8")
-    print(f"[OK] Saved to {filepath}")
+    print(f"[OK] Saved raw_md to {filepath}")
     return filepath
 
 

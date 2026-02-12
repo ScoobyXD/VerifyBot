@@ -6,7 +6,7 @@ __pycache__/
 **/__pycache__/
 
 # Generated outputs
-outputs/
+raw_md/
 
 # The Extracted Code
 generated/
