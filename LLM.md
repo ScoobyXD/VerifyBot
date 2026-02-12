@@ -2,9 +2,9 @@
 
 ## What This Is
 
-A set of Python scripts that turn ChatGPT's browser UI into a programmable code generation and execution pipeline. No API keys. No credits. Just Playwright driving the same browser window you'd use manually.
+A set of Python scripts that turn ChatGPT's browser UI into a programmable code generation, execution, and verification pipeline. No API keys. No credits. Just Playwright driving the same browser window you'd use manually.
 
-The system sends prompts to ChatGPT, scrapes the response, extracts code blocks, saves them as real files, and optionally runs them — all from one command.
+The system sends prompts to ChatGPT, scrapes the response, extracts code blocks, saves them as real files, runs them, and — if they fail — packages the original response and error output together and sends it back to ChatGPT for a fix. All from one command.
 
 ## Why
 
@@ -24,7 +24,7 @@ You run a command
   (Playwright opens browser, types prompt, waits for response)
         │
         ▼
-  Response saved as markdown
+  Response saved to raw_md/
   (with code fences reconstructed from DOM)
         │
         ▼
@@ -32,20 +32,34 @@ You run a command
   (extracts code blocks, detects language, finds filename hints)
         │
         ▼
-  Code saved to your project folder
+  Code saved to generated/
         │
         ▼
-  Optionally executed, output captured
+  Executed, output captured
+        │
+        ▼ (if --verify and code failed)
+  Package raw_md + execution output
+        │
+        ▼
+  Send back to ChatGPT for fix
+  (loops up to --max-retries times)
 ```
+
+## Directory Structure
+
+| Directory | Contents |
+|---|---|
+| `raw_md/` | ChatGPT responses saved as timestamped markdown (the "raw" LLM output) |
+| `generated/` | Extracted code files ready to run |
+| `.browser_profile/` | Persistent Chromium login cookies |
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `chatgpt_skill.py` | Browser automation — send prompts, extract responses |
-| `code_skill.py` | Parse code blocks from responses, save files, run them |
+| `chatgpt_skill.py` | Browser automation — send prompts, extract responses, save to `raw_md/` |
+| `code_skill.py` | Parse code blocks from `raw_md/`, save to `generated/`, run, and verify |
 | `selectors.py` | All ChatGPT DOM selectors in one place (update here when UI changes) |
-| `test_setup.py` | Verify Playwright + login are working |
 
 ## Usage
 
@@ -53,19 +67,45 @@ You run a command
 # First time: log in manually (cookies persist)
 python chatgpt_skill.py --login
 
-# Send a prompt and save the response
+# Send a prompt and save the response to raw_md/
 python chatgpt_skill.py --prompt "write a linked list in C" --headed
 
-# Extract code from a saved response into your project
-python code_skill.py extract outputs/response.md --dest ./my_project/
+# Extract code from a raw_md response into generated/
+python code_skill.py extract raw_md/response.md
 
-# Full pipeline: prompt → extract → save → run
-python code_skill.py pipeline "generate a python fizzbuzz" --dest ./generated/ --headed
+# Extract and run
+python code_skill.py extract raw_md/response.md --run
+
+# Full pipeline: prompt → extract → save to generated/ → run
+python code_skill.py pipeline "generate a python fizzbuzz" --headed
+
+# Full pipeline WITH verification loop:
+# If code fails, sends raw_md + error back to ChatGPT for a fix
+python code_skill.py pipeline "generate a python fizzbuzz" --verify --headed
+
+# Limit retries
+python code_skill.py pipeline "generate a python fizzbuzz" --verify --max-retries 5
 ```
+
+## Verification Loop
+
+The `--verify` flag enables the feedback loop. When generated code fails:
+
+1. The system reads the original `raw_md/` file (ChatGPT's full response)
+2. Reads each generated code file
+3. Captures stdout, stderr, and exit code from execution
+4. Packages all of it into a structured follow-up prompt
+5. Sends it back to ChatGPT: "here's what you gave me, here's the error, fix it"
+6. Extracts the new code, runs it again
+7. Repeats up to `--max-retries` times (default: 3)
+
+This is the error-driven retry loop — the system doesn't trust ChatGPT's claims, it verifies against reality and feeds errors back until the code actually works.
 
 ## Design Decisions
 
 **Persistent browser profile.** You log in once. Cookies are saved to `.browser_profile/`. Every subsequent run reuses the session. No re-authentication.
+
+**raw_md as the source of truth.** ChatGPT's full response is always saved to `raw_md/` before any extraction happens. This is the unmodified LLM output. Code extraction from `raw_md/` into `generated/` is a separate step, so you always have the original to reference or re-extract from.
 
 **DOM-level code extraction.** ChatGPT's `inner_text()` strips backtick fences. The scraper reads `<pre><code>` elements directly, pulls the language from CSS classes like `language-python`, and reconstructs proper fenced markdown. This means saved responses have clean code blocks that parse reliably.
 
@@ -79,7 +119,6 @@ python code_skill.py pipeline "generate a python fizzbuzz" --dest ./generated/ -
 
 - **File upload to ChatGPT** — sending code/images as context for the prompt
 - **Multi-turn conversations** — continuing a thread instead of starting fresh each time
-- **Error-driven retry loops** — if the generated code fails, re-prompt with the error automatically
 - **Hardware integration** — flashing MCUs, sniffing CAN buses, verifying against real measurements
 - **Claude browser support** — same approach, different selectors
 
