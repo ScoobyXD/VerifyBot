@@ -5,8 +5,11 @@
 __pycache__/
 **/__pycache__/
 
-# Generated outputs
+# Raw ChatGPT responses
 raw_md/
 
 # The Extracted Code
-generated/
+programs/
+
+# Pipeline run logs
+runs/
