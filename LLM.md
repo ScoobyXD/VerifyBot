@@ -30,16 +30,19 @@ You run a command
   chatgpt_skill.py sends prompt (reuses session)
         │
         ▼
-  Response saved to raw_md/
+  Response saved to raw_md/ (with prompt sent)
         │
         ▼
   code_skill.py extracts code blocks
+  → extraction details appended to raw_md
         │
         ▼
   Code saved to programs/ (with filename hints)
+  → saved file paths appended to raw_md
         │
         ▼
   Dependencies checked (missing imports detected)
+  → dependency actions appended to raw_md
         │
         ▼ (if missing deps)
   User prompted: "Install numpy with pip? (y/n)"
@@ -48,6 +51,7 @@ You run a command
         ▼
   Compiled (C/C++) or interpreted (Python/bash/JS)
   Long-running programs detected via static analysis
+  → full stdout/stderr/exit codes appended to raw_md
         │
         ▼ (if timeout)
   Smart timeout: did it produce output?
@@ -57,13 +61,16 @@ You run a command
         ▼ (if --verify and code failed)
   Errors sent back in SAME conversation as PLAIN TEXT
   (no markdown — prevents mangling in ChatGPT's input)
+  → feedback prompt text appended to raw_md
+  (NOTE: only errors go to ChatGPT, NOT the full md)
         │
         ▼
   New code extracted, compiled/run again
+  → retry response + results appended to master raw_md
   (loops up to --max-retries times)
         │
         ▼
-  Run log saved to runs/ (JSON audit trail)
+  Final status appended to raw_md
   Honest status: SUCCESS only if code actually ran correctly
 ```
 
@@ -71,9 +78,8 @@ You run a command
 
 | Directory | Contents |
 |---|---|
-| `raw_md/` | ChatGPT responses as timestamped markdown (unmodified LLM output) |
+| `raw_md/` | Full pipeline history as timestamped markdown — includes the prompt sent, ChatGPT's response, code extraction details, compilation/execution output, feedback prompts, and final status. Each attempt creates its own file; the first attempt's file also accumulates retry history for a complete audit trail. |
 | `programs/` | Extracted code files ready to compile/run |
-| `runs/` | JSON logs of each pipeline execution (prompt, attempts, results) |
 | `.browser_profile/` | Persistent Chromium login cookies |
 
 ## Files
@@ -81,8 +87,8 @@ You run a command
 | File | Purpose |
 |---|---|
 | `session.py` | `ChatGPTSession` — persistent browser wrapper. Open once, reuse for multiple prompts. Supports `prompt()` (new chat) and `followup()` (same conversation). Uses DOM injection for long prompts to prevent content mangling. |
-| `chatgpt_skill.py` | Send prompts, extract responses, save to `raw_md/`. Uses `ChatGPTSession` internally. CLI entry point for standalone use. |
-| `code_skill.py` | Extract code from `raw_md/`, save to `programs/`, compile/run, dependency management, smart timeout handling, verify loop, run logging. Main pipeline orchestrator. |
+| `chatgpt_skill.py` | Send prompts, extract responses, save to `raw_md/`. Provides `save_response()` for initial response capture and `append_to_log()` for incrementally recording pipeline activity (extraction, execution, feedback) into the same markdown file. CLI entry point for standalone use. |
+| `code_skill.py` | Extract code from `raw_md/`, save to `programs/`, compile/run, dependency management, smart timeout handling, verify loop. Main pipeline orchestrator. |
 | `selectors.py` | All ChatGPT DOM selectors (update here when UI changes). |
 
 ## Usage
@@ -112,8 +118,8 @@ python code_skill.py pipeline "make me a calculator in C" --verify --max-retries
 # Longer timeout for programs that take a while
 python code_skill.py pipeline "write a web scraper" --verify --timeout 120
 
-# Review past pipeline runs
-python code_skill.py history
+# Review past pipeline runs in raw_md/
+ls raw_md/
 ```
 
 ## Key Features
@@ -133,7 +139,8 @@ Not all timeouts are failures. A random number generator writing CSV rows indefi
 The system uses `subprocess.Popen` for streaming output capture and classifies timeouts by outcome:
 
 - **Program produced stdout before timeout** → `SUCCESS` (it was working, we stopped it)
-- **Program produced nothing before timeout** → `FAILURE` (hung or broken)
+- **Program created or modified files before timeout** → `SUCCESS` (it was writing output to disk, even without stdout)
+- **Program produced nothing and created no files** → `FAILURE` (hung or broken)
 - **Program produced only stderr** → `FAILURE` (crashing slowly)
 
 Additionally, `classify_program()` does static analysis to detect likely long-running patterns (`while True`, servers, polling loops, `input()` calls) and annotates the result so the verify loop doesn't waste retries trying to "fix" intentionally infinite programs.
@@ -160,8 +167,22 @@ ChatGPT responses are scanned for filename hints — bold names like **CAN.c**, 
 ### Honest Status Reporting
 The pipeline reports SUCCESS only when code actually ran and exited cleanly (or produced output before a timeout). Skipped files (unknown extensions, unrunnable formats) no longer silently count as "passed." If max retries are exhausted, the pipeline says FAILED — not "complete."
 
-### Run Logging
-Every pipeline run saves a JSON log to `runs/` with the full lifecycle: original prompt, each attempt's extracted files, execution results, feedback prompts, dependencies installed, and final status. Use `code_skill.py history` to review.
+### Comprehensive raw_md Pipeline History
+Each pipeline run produces a rich markdown file in `raw_md/` that captures the entire lifecycle in human-readable form:
+
+1. **Prompt sent** — the full text sent to ChatGPT (including platform context)
+2. **ChatGPT response** — the complete response as received
+3. **Code extraction** — which blocks were found, languages, sizes
+4. **Saved files** — where code was written to disk
+5. **Execution results** — stdout, stderr, exit codes, timeout behavior
+6. **Feedback prompts** — the exact error text sent back to ChatGPT (on retry)
+7. **Retry responses** — subsequent ChatGPT responses appended to the master file
+8. **Final status** — SUCCESS or FAILED with reason
+9. **Run Record (JSON)** — structured machine-readable summary embedded at the end, containing: attempt count, file paths, execution result summaries (truncated stdout/stderr), dependencies installed, timing, and final status
+
+The first attempt's file serves as the "master log" for the entire pipeline run — all retry activity is appended to it, including the final JSON run record. Individual retry attempts also get their own standalone files.
+
+**Important:** Only error messages are sent to ChatGPT as feedback. The raw_md file captures everything for your reference, but the ChatGPT conversation stays lean to preserve context window.
 
 ## Architecture: session.py
 
@@ -219,15 +240,17 @@ The concrete endgame for embedded work:
 | Multi-turn conversation (follow-ups in same chat) | **Done** |
 | C/C++ compilation support | **Done** |
 | Multi-file filename extraction | **Done** |
-| Run logging (JSON audit trail in `runs/`) | **Done** |
+| Comprehensive raw_md pipeline history logging | **Done** |
 | Plain-text feedback (fix markdown mangling bug) | **Done** |
 | Dependency detection & install with permission | **Done** |
 | Platform-aware prompting (Windows/Linux context) | **Done** |
 | Windows .sh handling (WSL/Git Bash routing) | **Done** |
 | Honest success/failure reporting | **Done** |
 | Smart timeout handling (streaming output capture) | **Done** |
+| File-creation-aware timeout (detect disk writes without stdout) | **Done** |
 | Static analysis for long-running program detection | **Done** |
 | Rename: `programs/` dir, `program_N` filenames | **Done** |
+| Comprehensive raw_md pipeline history logging | **Done** |
 
 ### Next: Output Validation
 > *Exit code 0 is not enough — verify the output makes sense*
@@ -291,7 +314,7 @@ ChatGPT's input field interprets markdown formatting. Triple backticks, `###` he
 A program that runs without crashing isn't necessarily correct. A rocket simulator outputting `Apogee: 0.0 m` exits cleanly but is obviously wrong. Output validation (Next phase) will address this.
 
 ### Timeout ≠ Failure
-A continuous data generator killed at 30 seconds isn't broken — it was doing its job. The smart timeout system now captures streaming output via `Popen` and classifies the outcome based on whether the program was actually producing useful output before being killed. Long-running patterns (`while True`, servers, polling loops) are detected via static analysis.
+A continuous data generator killed at 30 seconds isn't broken — it was doing its job. The smart timeout system now captures streaming output via `Popen` and classifies the outcome based on whether the program was actually producing useful output before being killed. It also snapshots the working directory before and after execution to detect programs that write to files (e.g. CSV output) even when stdout is empty or buffered. Long-running patterns (`while True`, servers, polling loops) are detected via static analysis.
 
 ### Dependency Hell
 ChatGPT loves generating code with `numpy`, `matplotlib`, `requests`, etc. without checking if they're installed. Pre-execution import scanning catches this before wasting a retry cycle on a `ModuleNotFoundError`.
