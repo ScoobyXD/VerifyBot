@@ -33,15 +33,23 @@ def ensure_dirs():
     PROGRAMS_DIR.mkdir(exist_ok=True)
 
 
-def save_response(prompt: str, response: str) -> Path:
-    """Save prompt/response pair as a timestamped markdown file in raw_md/."""
+def save_response(prompt: str, response: str, attempt: int = None,
+                  is_retry: bool = False) -> Path:
+    """Save prompt/response pair as a timestamped markdown file in raw_md/.
+    
+    This creates the initial file. Use append_to_log() to add terminal output,
+    extraction results, run results, and feedback prompts as the pipeline progresses.
+    """
     ensure_dirs()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     slug = prompt[:40].replace(" ", "_").replace("/", "_")
     filename = f"{ts}_{slug}.md"
     filepath = RAW_MD_DIR / filename
 
-    content = f"""# ChatGPT Response
+    attempt_label = f" (Attempt {attempt})" if attempt else ""
+    retry_label = " — RETRY (same conversation)" if is_retry else ""
+
+    content = f"""# ChatGPT Response{attempt_label}{retry_label}
 **Timestamp**: {datetime.now().isoformat()}  
 **Prompt**: {prompt}
 
@@ -54,6 +62,29 @@ def save_response(prompt: str, response: str) -> Path:
     filepath.write_text(content, encoding="utf-8")
     print(f"[OK] Saved raw_md to {filepath}")
     return filepath
+
+
+def append_to_log(filepath: Path, section_title: str, content: str):
+    """Append a new section to an existing raw_md log file.
+    
+    Used by the pipeline to incrementally record everything that happens:
+    extraction results, compilation output, run output, feedback prompts, etc.
+    """
+    if not filepath or not filepath.exists():
+        return
+    
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    section = f"""
+
+---
+
+## {section_title}
+_[{timestamp}]_
+
+{content}
+"""
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(section)
 
 
 def run_login_mode():

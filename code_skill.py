@@ -38,7 +38,6 @@ from typing import List, Optional
 
 PROGRAMS_DIR = Path(__file__).parent / "programs"
 RAW_MD_DIR = Path(__file__).parent / "raw_md"
-RUNS_DIR = Path(__file__).parent / "runs"
 
 # ---------------------------------------------------------------------------
 # Code block extraction
@@ -335,8 +334,8 @@ def run_file_with_streaming(cmd: list, filepath: Path, timeout: int = 30) -> dic
     this uses Popen to capture output as it arrives. When a timeout hits,
     we can distinguish between:
     
-    1. Program was producing output (working, just long-running) → timeout_ok
-    2. Program produced nothing (likely hung/broken) → timeout_fail
+    1. Program was producing output OR created files (working, just long-running) → timeout_ok
+    2. Program produced nothing and created no files (likely hung/broken) → timeout_fail
     3. Program produced stderr only (crashing slowly) → timeout_fail
     """
     import threading
@@ -344,13 +343,18 @@ def run_file_with_streaming(cmd: list, filepath: Path, timeout: int = 30) -> dic
     stdout_lines = []
     stderr_lines = []
     
+    # Snapshot files in the working directory BEFORE running, so we can
+    # detect if the program created or modified files during execution.
+    work_dir = filepath.parent
+    pre_files = _snapshot_dir(work_dir)
+    
     try:
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=filepath.parent,
+            cwd=work_dir,
         )
         
         # Read stdout/stderr in threads to avoid deadlock
@@ -383,15 +387,23 @@ def run_file_with_streaming(cmd: list, filepath: Path, timeout: int = 30) -> dic
             has_stdout = bool(stdout_text.strip())
             has_stderr = bool(stderr_text.strip())
             
+            # Check if the program created or modified files (e.g. writing CSV)
+            post_files = _snapshot_dir(work_dir)
+            new_or_changed = _diff_snapshots(pre_files, post_files)
+            has_file_output = bool(new_or_changed)
+            
             # Classify the program's behavior
             hints = classify_program(filepath)
             
-            if has_stdout and not has_stderr:
-                # Program was producing output — it was working, we just stopped it
+            # Program was producing output OR creating files → it was working
+            if (has_stdout or has_file_output) and not has_stderr:
                 print(f"  [TIMEOUT] Killed after {timeout}s — but program was producing output")
+                if has_file_output:
+                    print(f"  [FILES] Created/modified during execution: {', '.join(new_or_changed)}")
                 if hints.get("long_running"):
                     print(f"  [INFO] Detected as long-running ({hints['reason']})")
-                print(f"  [STDOUT] (last 500 chars)\n{stdout_text[-500:]}")
+                if has_stdout:
+                    print(f"  [STDOUT] (last 500 chars)\n{stdout_text[-500:]}")
                 return {
                     "success": True,
                     "timeout": True,
@@ -399,12 +411,18 @@ def run_file_with_streaming(cmd: list, filepath: Path, timeout: int = 30) -> dic
                     "returncode": -1,
                     "stdout": stdout_text,
                     "stderr": stderr_text,
-                    "note": f"Program was producing output when killed after {timeout}s. This is likely intentional behavior.",
+                    "files_created": new_or_changed,
+                    "note": f"Program was working when killed after {timeout}s"
+                           + (f" (created files: {', '.join(new_or_changed)})" if has_file_output else "")
+                           + ". This is likely intentional behavior.",
                 }
-            elif has_stdout and has_stderr:
-                # Had both output and errors — ambiguous, but leaning toward working
+            elif (has_stdout or has_file_output) and has_stderr:
+                # Had output/files and errors — ambiguous, but leaning toward working
                 print(f"  [TIMEOUT] Killed after {timeout}s — produced both output and errors")
-                print(f"  [STDOUT] (last 300 chars)\n{stdout_text[-300:]}")
+                if has_file_output:
+                    print(f"  [FILES] Created/modified: {', '.join(new_or_changed)}")
+                if has_stdout:
+                    print(f"  [STDOUT] (last 300 chars)\n{stdout_text[-300:]}")
                 print(f"  [STDERR] (last 300 chars)\n{stderr_text[-300:]}")
                 return {
                     "success": True,
@@ -413,10 +431,11 @@ def run_file_with_streaming(cmd: list, filepath: Path, timeout: int = 30) -> dic
                     "returncode": -1,
                     "stdout": stdout_text,
                     "stderr": stderr_text,
+                    "files_created": new_or_changed,
                     "note": f"Program had output and warnings when killed after {timeout}s.",
                 }
             else:
-                # No stdout, or only stderr — this is a real problem
+                # No stdout, no files created, or only stderr — this is a real problem
                 print(f"  [TIMEOUT] Killed after {timeout}s — no useful output produced")
                 if has_stderr:
                     print(f"  [STDERR]\n{stderr_text[:500]}")
@@ -447,6 +466,49 @@ def run_file_with_streaming(cmd: list, filepath: Path, timeout: int = 30) -> dic
     except FileNotFoundError as e:
         print(f"  [ERROR] {e}")
         return {"success": False, "error": str(e)}
+
+
+def _snapshot_dir(directory: Path) -> dict:
+    """Take a snapshot of files in a directory (name → mtime+size).
+    
+    Only goes one level deep + one level of subdirs to catch things like
+    output/ folders that programs commonly create.
+    """
+    snap = {}
+    try:
+        for item in directory.iterdir():
+            if item.is_file() and not item.name.startswith("."):
+                try:
+                    stat = item.stat()
+                    snap[str(item.relative_to(directory))] = (stat.st_mtime, stat.st_size)
+                except OSError:
+                    pass
+            elif item.is_dir() and not item.name.startswith("."):
+                # One level deep into subdirs
+                try:
+                    for sub in item.iterdir():
+                        if sub.is_file():
+                            try:
+                                stat = sub.stat()
+                                snap[str(sub.relative_to(directory))] = (stat.st_mtime, stat.st_size)
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return snap
+
+
+def _diff_snapshots(before: dict, after: dict) -> list:
+    """Compare two directory snapshots. Return list of new or modified file names."""
+    changed = []
+    for name, (mtime, size) in after.items():
+        if name not in before:
+            changed.append(name)
+        elif before[name] != (mtime, size):
+            changed.append(name)
+    return changed
 
 
 def run_file(filepath: Path, timeout: int = 30) -> dict:
@@ -559,18 +621,43 @@ def _print_run_result(result: dict, timeout: int):
 
 
 # ---------------------------------------------------------------------------
-# Run logging
+# Result summarization (for JSON embedding in md)
 # ---------------------------------------------------------------------------
 
-def save_run_log(run_data: dict) -> Path:
-    """Save a run log to runs/ as JSON."""
-    RUNS_DIR.mkdir(exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    slug = run_data.get("prompt", "unknown")[:30].replace(" ", "_").replace("/", "_")
-    filepath = RUNS_DIR / f"{ts}_{slug}.json"
-    filepath.write_text(json.dumps(run_data, indent=2, default=str), encoding="utf-8")
-    print(f"  [LOG] Run saved to {filepath}")
-    return filepath
+def _summarize_results(run_results: list) -> list:
+    """Create a JSON-serializable summary of run results.
+    
+    Truncates stdout/stderr to keep the JSON block readable.
+    """
+    summaries = []
+    for r in run_results:
+        if r is None:
+            continue
+        s = {
+            "success": r.get("success"),
+            "returncode": r.get("returncode"),
+        }
+        if r.get("skipped"):
+            s["skipped"] = True
+        if r.get("timeout"):
+            s["timeout"] = True
+            s["timeout_ok"] = r.get("timeout_ok", False)
+        if r.get("error"):
+            s["error"] = r["error"][:300]
+        if r.get("files_created"):
+            s["files_created"] = r["files_created"]
+        if r.get("missing_imports"):
+            s["missing_imports"] = r["missing_imports"]
+        if r.get("stdout"):
+            s["stdout_chars"] = len(r["stdout"])
+            s["stdout_preview"] = r["stdout"][:200].strip()
+        if r.get("stderr"):
+            s["stderr_chars"] = len(r["stderr"])
+            s["stderr_preview"] = r["stderr"][:200].strip()
+        if r.get("note"):
+            s["note"] = r["note"]
+        summaries.append(s)
+    return summaries
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +708,7 @@ def build_feedback_prompt(code_files: list, run_results: list) -> str:
     lines.append("IMPORTANT: Do not use any third-party libraries unless absolutely necessary.")
     lines.append("If you must use external packages, list them at the top of your response")
     lines.append("in this exact format: DEPENDENCIES: package1, package2, package3")
+    lines.append("If no external packages are needed, do NOT include a DEPENDENCIES line at all.")
     lines.append("")
     lines.append("Please fix the code. Return the complete corrected version, not just the changes.")
 
@@ -731,8 +819,11 @@ def cmd_pipeline(prompt: str, dest: str = None, run: bool = True,
     
     With --verify: uses a persistent browser session and multi-turn conversation.
     If code fails, sends ONLY the errors back (ChatGPT remembers context).
+    
+    All activity (prompts, responses, extraction, compilation, execution,
+    feedback) is logged into the raw_md file for full audit trail.
     """
-    from chatgpt_skill import save_response, ensure_dirs
+    from chatgpt_skill import save_response, append_to_log, ensure_dirs
     from session import ChatGPTSession
 
     ensure_dirs()
@@ -746,12 +837,17 @@ def cmd_pipeline(prompt: str, dest: str = None, run: bool = True,
     print(f"PIPELINE: {mode}")
     print("=" * 50)
 
-    # --- Run log ---
+    # We'll track the "master" raw_md file for the entire pipeline run.
+    # Attempt 1 creates it; retries append to it (and also create their own).
+    master_md_path = None
+
+    # Structured run record — gets embedded as JSON into the master md file at the end
     run_log = {
         "prompt": prompt,
         "started_at": datetime.now().isoformat(),
         "verify": verify,
         "max_retries": max_retries,
+        "platform": "windows" if os.name == "nt" else "linux",
         "attempts": [],
     }
 
@@ -767,14 +863,16 @@ def cmd_pipeline(prompt: str, dest: str = None, run: bool = True,
                 "Do NOT use bash/shell scripts — use Python or PowerShell instead. "
                 "Avoid Linux-only tools. Prefer stdlib modules over third-party packages. "
                 "If third-party packages are required, list them at the top of your response "
-                "in this exact format: DEPENDENCIES: package1, package2, package3]\n\n"
+                "in this exact format: DEPENDENCIES: package1, package2, package3 "
+                "If no external packages are needed, do NOT include a DEPENDENCIES line.]\n\n"
             )
         else:
             platform_prefix = (
                 "[SYSTEM CONTEXT: Code will run on Linux with Python. "
                 "Prefer stdlib modules over third-party packages. "
                 "If third-party packages are required, list them at the top of your response "
-                "in this exact format: DEPENDENCIES: package1, package2, package3]\n\n"
+                "in this exact format: DEPENDENCIES: package1, package2, package3 "
+                "If no external packages are needed, do NOT include a DEPENDENCIES line.]\n\n"
             )
 
         augmented_prompt = platform_prefix + prompt
@@ -782,7 +880,11 @@ def cmd_pipeline(prompt: str, dest: str = None, run: bool = True,
         while attempt <= max_retries:
             attempt += 1
             is_retry = attempt > 1
-            attempt_log = {"attempt": attempt, "is_retry": is_retry}
+            attempt_log = {
+                "attempt": attempt,
+                "is_retry": is_retry,
+                "timestamp": datetime.now().isoformat(),
+            }
 
             if is_retry:
                 print(f"\n{'='*50}")
@@ -796,32 +898,65 @@ def cmd_pipeline(prompt: str, dest: str = None, run: bool = True,
             else:
                 response = session.prompt(augmented_prompt)
 
-            save_response(prompt if not is_retry else "(verify followup)", response)
+            # Save the response to raw_md
+            prompt_label = prompt if not is_retry else f"(verify followup #{attempt - 1})"
+            raw_md_path = save_response(prompt_label, response,
+                                        attempt=attempt, is_retry=is_retry)
 
-            # Find latest raw_md
-            raw_md_files = sorted(RAW_MD_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime)
-            raw_md_path = raw_md_files[-1] if raw_md_files else None
-            attempt_log["raw_md"] = str(raw_md_path) if raw_md_path else None
+            # Log the actual prompt that was sent (including platform prefix / feedback)
+            if is_retry:
+                append_to_log(raw_md_path, "Prompt Sent to ChatGPT (Feedback)",
+                              f"```\n{current_prompt}\n```")
+            else:
+                append_to_log(raw_md_path, "Prompt Sent to ChatGPT (Initial)",
+                              f"```\n{augmented_prompt}\n```")
+
+            # On first attempt, this becomes the master log file
+            if master_md_path is None:
+                master_md_path = raw_md_path
+
+            # For retries, also append to the master md so it has the full history
+            if is_retry and master_md_path and master_md_path != raw_md_path:
+                append_to_log(master_md_path,
+                              f"Retry {attempt - 1}/{max_retries} — ChatGPT Response",
+                              f"**Feedback prompt sent:**\n```\n{current_prompt}\n```\n\n"
+                              f"**ChatGPT response:**\n\n{response}")
 
             # Step 2: Extract code
             print(f"\n[2/4] Extracting code blocks...")
             blocks = extract_code_blocks(response)
             if not blocks:
                 print("[WARN] No code blocks in response. Raw response saved in raw_md/")
+                append_to_log(raw_md_path, "Code Extraction",
+                              "**No code blocks found in response.**")
+                if master_md_path and master_md_path != raw_md_path:
+                    append_to_log(master_md_path, f"Attempt {attempt} — Code Extraction",
+                                  "No code blocks found in response.")
                 attempt_log["status"] = "no_code_blocks"
                 run_log["attempts"].append(attempt_log)
                 break
 
+            extraction_info = f"Found **{len(blocks)}** code block(s):\n"
+            for b in blocks:
+                extraction_info += f"- `[{b.index}]` {b.language} — {len(b.code)} chars\n"
             print(f"  Found {len(blocks)} block(s)")
+            append_to_log(raw_md_path, "Code Extraction", extraction_info)
             attempt_log["blocks"] = len(blocks)
 
             # Check if ChatGPT declared dependencies
             dep_match = re.search(r"DEPENDENCIES:\s*(.+)", response, re.IGNORECASE)
             if dep_match:
-                declared_deps = [d.strip() for d in dep_match.group(1).split(",") if d.strip()]
+                raw_deps = dep_match.group(1).strip()
+                # Filter out sentinel values ChatGPT uses to say "no deps"
+                _no_dep_sentinels = {"none", "(none)", "n/a", "no", "null", "-", "0", ""}
+                declared_deps = [
+                    d.strip() for d in raw_deps.split(",")
+                    if d.strip() and d.strip().lower().strip("()") not in _no_dep_sentinels
+                ]
                 if declared_deps:
                     print(f"\n[DEPS] ChatGPT declared dependencies: {', '.join(declared_deps)}")
                     answer = input(f"  Install them with pip? (y/n): ").strip().lower()
+                    dep_log = f"ChatGPT declared: {', '.join(declared_deps)}\n"
                     if answer in ("y", "yes"):
                         for pkg in declared_deps:
                             print(f"  [INSTALL] pip install {pkg}")
@@ -831,8 +966,13 @@ def cmd_pipeline(prompt: str, dest: str = None, run: bool = True,
                             )
                             if install_result.returncode == 0:
                                 print(f"  [OK] Installed {pkg}")
+                                dep_log += f"- Installed {pkg}: OK\n"
                             else:
                                 print(f"  [FAIL] Could not install {pkg}: {install_result.stderr[:200]}")
+                                dep_log += f"- Installed {pkg}: FAILED — {install_result.stderr[:200]}\n"
+                    else:
+                        dep_log += "User declined to install.\n"
+                    append_to_log(raw_md_path, "Dependency Installation", dep_log)
 
             # Step 3: Save to programs/
             if is_retry:
@@ -856,11 +996,16 @@ def cmd_pipeline(prompt: str, dest: str = None, run: bool = True,
                 fp = save_code_block(b, dest_dir, filename=fname)
                 saved_files.append(fp)
 
+            save_info = "Saved files:\n"
+            for fp in saved_files:
+                save_info += f"- `{fp}`\n"
+            append_to_log(raw_md_path, "Saved Files", save_info)
             attempt_log["files"] = [str(f) for f in saved_files]
 
             # Step 4: Run
             if not run:
                 print("\n[DONE] Pipeline complete (no execution requested).")
+                append_to_log(raw_md_path, "Execution", "Skipped (no execution requested).")
                 attempt_log["status"] = "no_run"
                 run_log["attempts"].append(attempt_log)
                 break
@@ -869,34 +1014,61 @@ def cmd_pipeline(prompt: str, dest: str = None, run: bool = True,
             run_results = []
             all_passed = True
             any_ran = False  # Track if at least one file actually executed
+            execution_log = ""
 
             for fp in saved_files:
                 result = run_file(fp, timeout=timeout)
                 run_results.append(result)
-                
+
+                # Build execution log for the md file
+                execution_log += f"### `{fp.name}`\n"
                 if result.get("skipped"):
-                    continue  # Truly skippable (header files)
-                
+                    execution_log += "Skipped (header file / not directly runnable)\n\n"
+                    continue
+
                 any_ran = True
-                if not result.get("success"):
+                if result.get("success"):
+                    if result.get("timeout_ok"):
+                        execution_log += f"**Result:** SUCCESS (produced output before {timeout}s timeout)\n"
+                    else:
+                        execution_log += f"**Result:** SUCCESS (exit code 0)\n"
+                else:
+                    execution_log += f"**Result:** FAILED (exit code {result.get('returncode', '?')})\n"
                     all_passed = False
+
+                if result.get("stdout"):
+                    stdout_preview = result['stdout'][:2000]
+                    execution_log += f"\n**stdout:**\n```\n{stdout_preview}\n```\n"
+                if result.get("stderr"):
+                    stderr_preview = result['stderr'][:2000]
+                    execution_log += f"\n**stderr:**\n```\n{stderr_preview}\n```\n"
+                if result.get("error"):
+                    execution_log += f"\n**error:** {result['error']}\n"
+                if result.get("note"):
+                    execution_log += f"\n**note:** {result['note']}\n"
+                execution_log += "\n"
             
             # If nothing actually ran (all skipped/unknown), that's not success
             if not any_ran:
                 print(f"\n[WARN] No files were actually executed (all skipped or unrunnable)")
+                execution_log += "\n**Warning:** No files were actually executed (all skipped or unrunnable)\n"
                 all_passed = False
 
-            attempt_log["results"] = run_results
+            append_to_log(raw_md_path, "Execution Results", execution_log)
 
             if all_passed and any_ran:
                 print(f"\n[DONE] All code ran successfully!")
+                append_to_log(raw_md_path, "Pipeline Status", "**SUCCESS** — All code ran successfully.")
+                if master_md_path and master_md_path != raw_md_path:
+                    append_to_log(master_md_path, f"Attempt {attempt} — Result", "SUCCESS")
                 attempt_log["status"] = "success"
+                attempt_log["results"] = _summarize_results(run_results)
                 run_log["attempts"].append(attempt_log)
                 break
 
             # --- Code failed ---
             attempt_log["status"] = "failed"
-            run_log["attempts"].append(attempt_log)
+            attempt_log["results"] = _summarize_results(run_results)
 
             # --- Check for missing dependencies and offer to install ---
             missing_deps = set()
@@ -907,6 +1079,7 @@ def cmd_pipeline(prompt: str, dest: str = None, run: bool = True,
             if missing_deps:
                 print(f"\n[DEPS] Missing Python packages: {', '.join(sorted(missing_deps))}")
                 answer = input(f"  Install them with pip? (y/n): ").strip().lower()
+                dep_install_log = f"Missing packages detected: {', '.join(sorted(missing_deps))}\n"
                 if answer in ("y", "yes"):
                     for pkg in sorted(missing_deps):
                         print(f"  [INSTALL] pip install {pkg}")
@@ -916,85 +1089,95 @@ def cmd_pipeline(prompt: str, dest: str = None, run: bool = True,
                         )
                         if install_result.returncode == 0:
                             print(f"  [OK] Installed {pkg}")
+                            dep_install_log += f"- Installed {pkg}: OK\n"
                         else:
                             print(f"  [FAIL] Could not install {pkg}: {install_result.stderr[:200]}")
+                            dep_install_log += f"- Installed {pkg}: FAILED\n"
                     
+                    append_to_log(raw_md_path, "Dependency Installation (Post-Run)", dep_install_log)
+
                     # Re-run after installing — don't waste a retry on a dependency issue
                     print(f"\n[RERUN] Re-executing after dependency install...")
                     run_results = []
                     all_passed = True
                     any_ran = False
+                    rerun_log = ""
                     for fp in saved_files:
                         result = run_file(fp, timeout=timeout)
                         run_results.append(result)
+                        rerun_log += f"### `{fp.name}`\n"
                         if result.get("skipped"):
+                            rerun_log += "Skipped\n\n"
                             continue
                         any_ran = True
                         if not result.get("success"):
                             all_passed = False
+                            rerun_log += f"FAILED (exit {result.get('returncode', '?')})\n"
+                            if result.get("stderr"):
+                                rerun_log += f"```\n{result['stderr'][:1000]}\n```\n"
+                        else:
+                            rerun_log += "SUCCESS\n"
+                        if result.get("stdout"):
+                            rerun_log += f"```\n{result['stdout'][:1000]}\n```\n"
+                        rerun_log += "\n"
+
+                    append_to_log(raw_md_path, "Re-Run After Dependency Install", rerun_log)
                     
                     if all_passed and any_ran:
                         print(f"\n[DONE] All code ran successfully after installing dependencies!")
+                        append_to_log(raw_md_path, "Pipeline Status",
+                                      "**SUCCESS** — All code ran after dependency install.")
                         attempt_log["status"] = "success"
-                        attempt_log["results"] = run_results
+                        attempt_log["results"] = _summarize_results(run_results)
                         attempt_log["deps_installed"] = list(missing_deps)
-                        # Update the last attempt in the log
-                        run_log["attempts"][-1] = attempt_log
+                        run_log["attempts"].append(attempt_log)
                         break
+                else:
+                    dep_install_log += "User declined to install.\n"
+                    append_to_log(raw_md_path, "Dependency Installation (Post-Run)", dep_install_log)
 
             if not verify or attempt > max_retries:
+                run_log["attempts"].append(attempt_log)
                 if not verify:
-                    print(f"\n[INFO] Code failed. Use --verify to auto-retry with ChatGPT.")
+                    status_msg = "Code failed. Use --verify to auto-retry with ChatGPT."
+                    print(f"\n[INFO] {status_msg}")
                 else:
-                    print(f"\n[FAIL] Max retries ({max_retries}) reached. Code still failing.")
+                    status_msg = f"Max retries ({max_retries}) reached. Code still failing."
+                    print(f"\n[FAIL] {status_msg}")
+                append_to_log(raw_md_path, "Pipeline Status", f"**FAILED** — {status_msg}")
+                if master_md_path and master_md_path != raw_md_path:
+                    append_to_log(master_md_path, f"Attempt {attempt} — Result",
+                                  f"FAILED — {status_msg}")
                 break
 
             # Step 5: Build feedback and loop (multi-turn in same conversation)
+            # NOTE: Only error messages go to ChatGPT (not the entire md file)
             print(f"\n[4/4] Sending errors back to ChatGPT (same conversation)...")
             current_prompt = build_feedback_prompt(saved_files, run_results)
             print(f"  Feedback prompt: {len(current_prompt)} chars")
+            attempt_log["feedback_chars"] = len(current_prompt)
+            run_log["attempts"].append(attempt_log)
 
-    # Save run log
+            # Log the feedback that will be sent
+            append_to_log(raw_md_path, "Feedback Prompt (to be sent to ChatGPT)",
+                          f"```\n{current_prompt}\n```")
+            if master_md_path and master_md_path != raw_md_path:
+                append_to_log(master_md_path, f"Attempt {attempt} — Feedback Sent",
+                              f"```\n{current_prompt}\n```")
+
+    # --- Finalize run record and embed into master md ---
     run_log["finished_at"] = datetime.now().isoformat()
-    final_status = run_log["attempts"][-1]["status"] if run_log["attempts"] else "no_attempts"
-    run_log["final_status"] = final_status
-    save_run_log(run_log)
+    run_log["total_attempts"] = attempt
+    run_log["final_status"] = (
+        run_log["attempts"][-1].get("status", "unknown")
+        if run_log["attempts"] else "no_attempts"
+    )
 
-    attempts_used = len(run_log['attempts'])
-    if final_status == "success":
-        print(f"\n[DONE] Pipeline SUCCEEDED after {attempts_used} attempt(s).")
-    elif final_status == "failed":
-        print(f"\n[FAIL] Pipeline FAILED after {attempts_used} attempt(s). "
-              f"Code still has errors. Check runs/ log for details.")
-    else:
-        print(f"\n[DONE] Pipeline finished after {attempts_used} attempt(s). "
-              f"Status: {final_status}")
+    if master_md_path:
+        append_to_log(master_md_path, "Run Record (JSON)",
+                      f"```json\n{json.dumps(run_log, indent=2, default=str)}\n```")
 
-
-def cmd_history(n: int = 10):
-    """Show recent run logs."""
-    if not RUNS_DIR.exists():
-        print("[INFO] No runs directory yet. Run a pipeline first.")
-        return
-
-    logs = sorted(RUNS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not logs:
-        print("[INFO] No run logs found.")
-        return
-
-    print(f"Recent runs (last {min(n, len(logs))}):\n")
-    for log_path in logs[:n]:
-        data = json.loads(log_path.read_text())
-        prompt = data.get("prompt", "?")[:50]
-        status = data.get("final_status", "?")
-        attempts = len(data.get("attempts", []))
-        started = data.get("started_at", "?")[:19]
-
-        # Color-code status
-        status_icon = "✓" if status == "success" else "✗" if status == "failed" else "?"
-        print(f"  {status_icon}  {started}  [{attempts} attempt(s)]  {status:<12}  {prompt}")
-
-    print(f"\nLogs stored in: {RUNS_DIR}/")
+    print(f"\n[DONE] Pipeline finished after {attempt} attempt(s).")
 
 
 # ---------------------------------------------------------------------------
@@ -1031,10 +1214,6 @@ def main():
                              "Long-running programs that produce output before "
                              "timeout are still considered successful.")
 
-    # history
-    p_hist = sub.add_parser("history", help="Show recent run logs")
-    p_hist.add_argument("-n", type=int, default=10, help="Number of runs to show")
-
     args = parser.parse_args()
 
     if args.command == "extract":
@@ -1045,8 +1224,6 @@ def main():
         cmd_pipeline(args.prompt, dest=args.dest, run=not args.no_run,
                      headed=args.headed, verify=args.verify,
                      max_retries=args.max_retries, timeout=args.timeout)
-    elif args.command == "history":
-        cmd_history(n=args.n)
     else:
         parser.print_help()
 
