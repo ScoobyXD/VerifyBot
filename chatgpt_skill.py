@@ -13,203 +13,34 @@ Requires: pip install playwright && playwright install chromium
 
 import argparse
 import time
-import sys
-import os
-import json
 from datetime import datetime
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+from playwright.sync_api import sync_playwright
 
 import selectors as S
+from session import ChatGPTSession
 
 # --- Config ---
 PROFILE_DIR = Path(__file__).parent / ".browser_profile"
 RAW_MD_DIR = Path(__file__).parent / "raw_md"
-GENERATED_DIR = Path(__file__).parent / "generated"
+PROGRAMS_DIR = Path(__file__).parent / "programs"
 
 
 def ensure_dirs():
     PROFILE_DIR.mkdir(exist_ok=True)
     RAW_MD_DIR.mkdir(exist_ok=True)
-    GENERATED_DIR.mkdir(exist_ok=True)
-
-
-def launch_browser(pw, headed=True):
-    """Launch Chromium with persistent profile (keeps login cookies)."""
-    context = pw.chromium.launch_persistent_context(
-        user_data_dir=str(PROFILE_DIR),
-        headless=not headed,
-        viewport={"width": 1280, "height": 900},
-        # Reduce bot detection
-        args=[
-            "--disable-blink-features=AutomationControlled",
-        ],
-    )
-    return context
-
-
-def wait_for_page_ready(page):
-    """Wait for ChatGPT to fully load."""
-    page.goto(S.NEW_CHAT_URL, wait_until="domcontentloaded",
-              timeout=S.NAVIGATION_TIMEOUT * 1000)
-    # Wait for the prompt textarea to appear
-    page.wait_for_selector(S.PROMPT_TEXTAREA, timeout=S.NAVIGATION_TIMEOUT * 1000)
-    print("[OK] ChatGPT loaded, prompt textarea found.")
-
-
-def find_send_button(page):
-    """Try multiple selectors for the send button."""
-    for sel in S.SEND_BUTTON_SELECTORS:
-        btn = page.query_selector(sel)
-        if btn and btn.is_visible():
-            return btn
-    return None
-
-
-def send_prompt(page, prompt_text: str):
-    """Type a prompt and click send."""
-    # Focus and type into the textarea
-    textarea = page.wait_for_selector(S.PROMPT_TEXTAREA, timeout=10_000)
-    textarea.click()
-    
-    # Clear any existing text
-    page.keyboard.press("Control+a")
-    page.keyboard.press("Backspace")
-    
-    # Type with human-like delay
-    # For long prompts, use fill() instead of type() for speed
-    if len(prompt_text) > 500:
-        textarea.fill(prompt_text)
-    else:
-        textarea.type(prompt_text, delay=S.TYPING_DELAY_MS)
-    
-    time.sleep(0.5)
-    
-    # Click send
-    send_btn = find_send_button(page)
-    if send_btn:
-        send_btn.click()
-        print(f"[OK] Prompt sent ({len(prompt_text)} chars)")
-    else:
-        # Fallback: press Enter
-        print("[WARN] Send button not found, trying Enter key")
-        page.keyboard.press("Enter")
-    
-    time.sleep(S.POST_SEND_DELAY)
-
-
-def wait_for_response(page, timeout=S.RESPONSE_TIMEOUT):
-    """Wait for ChatGPT to finish streaming its response."""
-    print("[...] Waiting for response to complete...")
-    deadline = time.time() + timeout
-    
-    while time.time() < deadline:
-        # Check if stop button is still visible (still streaming)
-        still_streaming = False
-        for sel in S.STOP_GENERATING_SELECTORS:
-            stop_btn = page.query_selector(sel)
-            if stop_btn and stop_btn.is_visible():
-                still_streaming = True
-                break
-        
-        if not still_streaming:
-            # Double-check: look for completion indicators
-            for sel in S.RESPONSE_COMPLETE_INDICATORS:
-                indicator = page.query_selector(sel)
-                if indicator and indicator.is_visible():
-                    print("[OK] Response complete.")
-                    return True
-        
-        time.sleep(1)
-    
-    print("[WARN] Response timeout — may be incomplete.")
-    return False
-
-
-def extract_last_response(page) -> str:
-    """Get the text of the last assistant message.
-    
-    Strategy: inner_text() loses code fences (``` markers), so we
-    reconstruct them by finding <pre><code> blocks in the DOM and
-    wrapping their content with proper markdown fences before
-    returning the combined text.
-    """
-    for sel in S.ASSISTANT_MESSAGE_SELECTORS:
-        messages = page.query_selector_all(sel)
-        if not messages:
-            continue
-
-        last_msg = messages[-1]
-
-        # --- Extract code blocks from DOM first ---
-        code_blocks = []  # list of (language, code_text)
-        pre_elements = last_msg.query_selector_all("pre")
-        for pre in pre_elements:
-            code_el = pre.query_selector("code")
-            if code_el:
-                # ChatGPT puts language in class like "language-python"
-                classes = code_el.get_attribute("class") or ""
-                lang = ""
-                for cls in classes.split():
-                    if cls.startswith("language-"):
-                        lang = cls.replace("language-", "")
-                        break
-                    elif cls.startswith("lang-"):
-                        lang = cls.replace("lang-", "")
-                        break
-                code_text = code_el.inner_text()
-                code_blocks.append((lang, code_text))
-
-        # --- Get the full text ---
-        full_text = last_msg.inner_text()
-
-        # --- Replace the mangled code sections with proper fenced blocks ---
-        # inner_text() turns <pre><code> into something like:
-        #   python
-        #   Copy code
-        #   def hello():
-        #       ...
-        # We find these and replace with fenced versions.
-        for lang, code_text in code_blocks:
-            # Build the mangled pattern that inner_text() produces
-            # Try several variants ChatGPT uses
-            mangled_variants = []
-            clean_code = code_text.strip()
-
-            if lang:
-                mangled_variants.append(f"{lang}\nCopy code\n{clean_code}")
-                mangled_variants.append(f"{lang}\n Copy code\n{clean_code}")
-                mangled_variants.append(f"{lang}\nCopy\n{clean_code}")
-                mangled_variants.append(f"{lang}\n{clean_code}")
-
-            # The proper fenced replacement
-            fenced = f"```{lang}\n{clean_code}\n```"
-
-            replaced = False
-            for mangled in mangled_variants:
-                if mangled in full_text:
-                    full_text = full_text.replace(mangled, fenced, 1)
-                    replaced = True
-                    break
-
-            if not replaced:
-                # Fallback: just append fenced block if we can't find the mangled version
-                # (better to have duplicate than lose code)
-                full_text += f"\n\n{fenced}\n"
-
-        return full_text.strip()
-
-    return "[ERROR] Could not extract response"
+    PROGRAMS_DIR.mkdir(exist_ok=True)
 
 
 def save_response(prompt: str, response: str) -> Path:
     """Save prompt/response pair as a timestamped markdown file in raw_md/."""
+    ensure_dirs()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     slug = prompt[:40].replace(" ", "_").replace("/", "_")
     filename = f"{ts}_{slug}.md"
     filepath = RAW_MD_DIR / filename
-    
+
     content = f"""# ChatGPT Response
 **Timestamp**: {datetime.now().isoformat()}  
 **Prompt**: {prompt}
@@ -225,7 +56,7 @@ def save_response(prompt: str, response: str) -> Path:
     return filepath
 
 
-def run_login_mode(headed=True):
+def run_login_mode():
     """Open browser for manual login. Cookies persist."""
     print("=" * 50)
     print("LOGIN MODE")
@@ -233,94 +64,99 @@ def run_login_mode(headed=True):
     print("When done, close the browser window.")
     print("Your session will be saved for future runs.")
     print("=" * 50)
-    
+
+    PROFILE_DIR.mkdir(exist_ok=True)
     with sync_playwright() as pw:
-        ctx = launch_browser(pw, headed=True)
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            headless=False,
+            viewport={"width": 1280, "height": 900},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         page = ctx.new_page()
         page.goto(S.CHATGPT_URL)
-        
-        # Block until user closes the browser
+
         try:
             page.wait_for_event("close", timeout=0)
         except Exception:
             pass
-        
+
         ctx.close()
-    
+
     print("[OK] Login session saved.")
 
 
-def run_single_prompt(prompt: str, headed=False):
-    """Send one prompt, get response, save it."""
-    ensure_dirs()
+def run_single_prompt(prompt: str, headed: bool = False, session: ChatGPTSession = None) -> str:
+    """Send one prompt, get response, save it.
     
-    with sync_playwright() as pw:
-        ctx = launch_browser(pw, headed=headed)
-        page = ctx.new_page()
-        
-        try:
-            wait_for_page_ready(page)
-            send_prompt(page, prompt)
-            wait_for_response(page)
-            
-            response = extract_last_response(page)
-            filepath = save_response(prompt, response)
-            
-            print("\n--- RESPONSE ---")
-            # Print first 500 chars as preview
-            preview = response[:500]
-            if len(response) > 500:
-                preview += f"\n\n[... {len(response)} total chars, see {filepath}]"
-            print(preview)
-            
-            return response
-        
-        finally:
-            ctx.close()
+    If a session is provided, reuses it (for pipeline efficiency).
+    Otherwise creates a temporary session.
+    """
+    ensure_dirs()
+
+    if session:
+        response = session.prompt(prompt)
+        save_response(prompt, response)
+        _print_preview(response)
+        return response
+
+    with ChatGPTSession(headed=headed) as s:
+        response = s.prompt(prompt)
+        filepath = save_response(prompt, response)
+        _print_preview(response, filepath)
+        return response
 
 
-def run_interactive(headed=True):
+def run_single_followup(prompt: str, session: ChatGPTSession) -> str:
+    """Send a follow-up in the same conversation. Requires an open session."""
+    ensure_dirs()
+    response = session.followup(prompt)
+    save_response(prompt, response)
+    _print_preview(response)
+    return response
+
+
+def _print_preview(response: str, filepath: Path = None):
+    """Print a truncated preview of the response."""
+    print("\n--- RESPONSE ---")
+    preview = response[:500]
+    if len(response) > 500:
+        suffix = f"\n\n[... {len(response)} total chars"
+        if filepath:
+            suffix += f", see {filepath}"
+        suffix += "]"
+        preview += suffix
+    print(preview)
+
+
+def run_interactive(headed: bool = True):
     """Interactive mode: keep browser open, send multiple prompts."""
     ensure_dirs()
-    
+
     print("=" * 50)
     print("INTERACTIVE MODE")
     print("Type prompts. 'quit' to exit. 'new' for new chat.")
     print("=" * 50)
-    
-    with sync_playwright() as pw:
-        ctx = launch_browser(pw, headed=headed)
-        page = ctx.new_page()
-        
-        try:
-            wait_for_page_ready(page)
-            
-            while True:
-                prompt = input("\n> ").strip()
-                
-                if not prompt:
-                    continue
-                if prompt.lower() == "quit":
-                    break
-                if prompt.lower() == "new":
-                    page.goto(S.NEW_CHAT_URL, wait_until="domcontentloaded")
-                    page.wait_for_selector(S.PROMPT_TEXTAREA, timeout=15_000)
-                    print("[OK] New chat started.")
-                    continue
-                
-                send_prompt(page, prompt)
-                wait_for_response(page)
-                
-                response = extract_last_response(page)
-                save_response(prompt, response)
-                
-                print("\n--- RESPONSE ---")
-                print(response[:1000])
-                if len(response) > 1000:
-                    print(f"\n[... truncated, {len(response)} total chars]")
-        
-        finally:
-            ctx.close()
+
+    with ChatGPTSession(headed=headed) as s:
+        while True:
+            prompt = input("\n> ").strip()
+
+            if not prompt:
+                continue
+            if prompt.lower() == "quit":
+                break
+            if prompt.lower() == "new":
+                s.new_chat()
+                continue
+
+            response = s.followup(prompt)
+            save_response(prompt, response)
+
+            print("\n--- RESPONSE ---")
+            print(response[:1000])
+            if len(response) > 1000:
+                print(f"\n[... truncated, {len(response)} total chars]")
 
 
 def main():
@@ -333,9 +169,9 @@ def main():
                         help="Interactive multi-prompt mode")
     parser.add_argument("--headed", action="store_true",
                         help="Show browser window (default: headless for --prompt)")
-    
+
     args = parser.parse_args()
-    
+
     if args.login:
         run_login_mode()
     elif args.prompt:
