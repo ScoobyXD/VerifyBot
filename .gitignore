@@ -10,6 +10,3 @@ raw_md/
 
 # The Extracted Code
 programs/
-
-# Pipeline run logs
-runs/
