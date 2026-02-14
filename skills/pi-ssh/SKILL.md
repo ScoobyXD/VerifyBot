@@ -1,47 +1,49 @@
 ---
 name: pi-ssh
-description: SSH from a Windows laptop into a Linux Raspberry Pi, then update files after code extraction (raw_md -> programs). Includes a first-run command to create a hello markdown file on the Pi.
+description: SSH from Windows (or bash shells) into a Linux Raspberry Pi to create/update files after raw_md -> programs extraction, using local secret config files that are gitignored.
 ---
 
 # pi-ssh
 
-Use this skill when the task is to connect from Windows to Raspberry Pi over SSH and edit or create files remotely.
+Use this skill to SSH/SCP into a Raspberry Pi and update files safely without hardcoding credentials in scripts.
 
-## Inputs
-- Pi user: `scoobyxd`
-- Pi host: `ScoobyXD`
-- Local flow context: extracted files move from `raw_md` into `programs`
+## Security rule
+Never put real `PI_USER`, `PI_HOST`, or `PI_PASSWORD` in tracked files.
 
-## Workflow
-1. Confirm SSH client on Windows:
-   - `ssh -V`
-2. Connect:
-   - `ssh scoobyxd@ScoobyXD`
-   - Enter the password when prompted.
-3. First test action (create hello file on Pi):
-   - `echo "hello i ssh'd here" > ~/hello_ssh.md`
-4. Verify:
-   - `cat ~/hello_ssh.md`
+Store them only in a local file:
+- `.secrets/pi_ssh.env` (gitignored)
+- Start by copying: `skills/pi-ssh/assets/pi_ssh.env.example`
 
-## Non-interactive one-liner from Windows
-Use this only when you want a single command that creates the file immediately after login:
+## Setup
+1. Create local secret file:
+   - `cp skills/pi-ssh/assets/pi_ssh.env.example .secrets/pi_ssh.env`
+2. Edit `.secrets/pi_ssh.env` with your real values.
+3. On Windows (PowerShell), test manual SSH first:
+   - `ssh <PI_USER>@<PI_HOST>`
+   - Enter password when prompted.
 
-```powershell
-ssh scoobyxd@ScoobyXD "echo 'hello i ssh''d here' > ~/hello_ssh.md && cat ~/hello_ssh.md"
+## First action: create proof file on Pi
+From a bash-like shell (Git Bash/WSL/Linux/macOS), run:
+
+```bash
+bash skills/pi-ssh/scripts/pi_hello_ssh.sh
 ```
 
-## Updating extracted files later
-After extraction to local `programs/`, upload one file with SCP:
+What it does remotely:
+- creates `~/hello_ssh.md`
+- writes `hello i ssh'd here`
+- prints file details and contents
+
+## Why the previous run may have looked like "it did nothing"
+- SSH can fail before file creation (bad host/user/password/network)
+- Hostname may not resolve from your laptop (use Pi IP if needed)
+- Script may not have been executed from repo root
+- Password auth requires prompt unless `sshpass` is installed and `PI_PASSWORD` is set
+
+## Update extracted files (`programs/`) later
+PowerShell examples:
 
 ```powershell
-scp .\programs\pi_can_send.py scoobyxd@ScoobyXD:/home/scoobyxd/programs/pi_can_send.py
+scp .\programs\pi_can_send.py <PI_USER>@<PI_HOST>:/home/<PI_USER>/programs/pi_can_send.py
+ssh <PI_USER>@<PI_HOST> "python3 /home/<PI_USER>/programs/pi_can_send.py"
 ```
-
-Then run it remotely:
-
-```powershell
-ssh scoobyxd@ScoobyXD "python3 /home/scoobyxd/programs/pi_can_send.py"
-```
-
-## Optional helper script
-Use `scripts/pi_hello_ssh.sh` from this skill if you are already in a bash-like shell (Git Bash/WSL/macOS/Linux).
