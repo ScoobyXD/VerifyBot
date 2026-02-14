@@ -1,422 +1,274 @@
-# LLM.md — AI-Driven Hardware Self-Verification System
+# LLM.md -- AI-Driven Hardware Self-Verification System
 
 ## What This Is
 
-A set of Python scripts that turn ChatGPT's browser UI into a programmable code generation, execution, and verification pipeline — extended to **deploy code to real hardware** (Raspberry Pi 5 + STM32L476RG) and verify it works.
+A set of Python scripts that turn ChatGPT's browser UI into a programmable code generation, execution, and verification pipeline -- extended to **deploy code to real hardware** (Raspberry Pi 5 + STM32L476RG) and verify it works.
 
-The system sends a prompt to ChatGPT, scrapes the response, extracts code blocks, **identifies which code goes to which target** (Pi vs STM32), deploys each file to the correct machine's filesystem, executes/flashes it, captures terminal output from both targets, and — if anything fails — sends all the output back to ChatGPT in the same conversation for a fix. All from one command.
+The system sends a prompt to ChatGPT, scrapes the response, extracts code blocks, filters out junk (example output, run commands), **classifies where code should run** (local vs Pi), deploys each file to the correct target, executes it, captures output, and -- if anything fails -- sends the errors back to ChatGPT in the same conversation for a fix. All from one command.
 
 ## Why
 
 LLMs generate embedded code that compiles but doesn't work. The only way to know if it actually works is to run it on the hardware and observe what happens. This system closes that loop automatically.
 
-## The Fundamental Problem
-
-the fundamental task is from a LLM prompt and response, how to do then have it create distinct raspberry pi, or stm32 code, and those code will be properly copied and pasted onto the correct memory. For example, i say"spi to canbus between raspi and stm32" to chatgpt, it generates the code for it, gets put into md file, then extracted into distinct raspi and stm32 programs. Those files will be written to the correct raspi and stm32 file system, then have those respective machines execute, then maybe we conduct a test, send a raspi signal to stm32 and a stm32 signal to raspi, then we verify each result. Then we somehow get the terminal or error/success message from each raspi and stm32 and add to md history like we do now, then send it back to LLM
+## How It Works (Quick Version)
 
 ```
-You say: "SPI to CAN bus between raspi and stm32"
-                    │
-                    ▼
-        ChatGPT generates a response containing
-        BOTH raspi code AND stm32 code
-                    │
-                    ▼
-        Response saved to raw_md/ (same as before)
-                    │
-                    ▼
-        Code blocks extracted (same as before)
-                    │
-                    ▼
-   ┌────── NEW PROBLEM: Which code goes where? ──────┐
-   │                                                   │
-   │  Block 1: pi_can.py      → Raspberry Pi           │
-   │  Block 2: stm32_main.c   → STM32 (via Pi)        │
-   │  Block 3: stm32_can.h    → STM32 (via Pi)        │
-   │                                                   │
-   └───────────────────────────────────────────────────┘
-                    │
-          ┌────────┴────────┐
-          ▼                 ▼
-   Pi filesystem       Pi filesystem (staging)
-   /home/pi/hw/pi/     /home/pi/hw/stm32/
-   └─ pi_can.py        ├─ stm32_main.c
-                        └─ stm32_can.h
-          │                 │
-          ▼                 ▼
-   Pi executes         Pi cross-compiles
-   python3 pi_can.py   arm-none-eabi-gcc → .elf
-                              │
-                              ▼
-                        Pi flashes STM32
-                        openocd → program .elf
-          │                 │
-          ▼                 ▼
-   Pi stdout/stderr    STM32 UART output
-   captured            captured by Pi
-          │                 │
-          └────────┬────────┘
-                   ▼
-        BOTH outputs appended to raw_md/
-        (just like we do now for local execution)
-                   │
-                   ▼
-        If failed → send BOTH outputs back to
-        ChatGPT in same conversation → retry
+python scheduler.py "make a random word generator that saves to a text file in raspi"
 ```
 
-## What's New vs. What Already Exists
+What happens:
+1. `classify_target()` reads "raspi" in prompt -> routes to Pi
+2. Builds platform-aware prefix telling ChatGPT "this runs on Pi 5, Linux, ASCII only"
+3. Opens browser, sends prompt to ChatGPT
+4. Saves response to raw_md/
+5. Extracts code blocks, filters junk (one-liner bash, example output)
+6. Saves real program(s) to programs/ with meaningful filenames
+7. SFTP uploads to Pi, SSH executes python3 <script>
+8. Captures stdout/stderr
+9. If failed + verify on: builds error feedback, sends back to ChatGPT, loops
 
-**Already built (works today)**:
-- Browser automation: `session.py`, `chatgpt_skill.py`, `selectors.py`
-- Code extraction from responses: `code_skill.py`
-- Save to `raw_md/`, extract to `programs/`
-- Compile/run locally, capture stdout/stderr
-- Verification loop: send errors back to ChatGPT, retry in same conversation
-- Comprehensive pipeline history logging
-
-**New problems to solve**:
-
-| # | Problem | Solution |
-|---|---------|----------|
-| 1 | **Target identification** — which extracted code block goes to Pi vs STM32? | Filename hints + language heuristics (`.py` → Pi, `.c/.h` → STM32, or explicit filename like `pi_*.py`, `stm32_*.c`) |
-| 2 | **Remote file deployment** — code needs to land on Pi's filesystem, not laptop's | SSH/SCP from laptop to Pi |
-| 3 | **Cross-compilation** — STM32 C code must compile with `arm-none-eabi-gcc` on the Pi | Remote `ssh pi "cd /home/pi/hw/stm32 && make"` |
-| 4 | **Flashing** — compiled .elf must get onto the STM32 | Remote `ssh pi "openocd ... -c 'program main.elf verify reset exit'"` |
-| 5 | **Remote execution** — Pi-side scripts run on Pi, not laptop | Remote `ssh pi "cd /home/pi/hw/pi && python3 pi_can.py"` |
-| 6 | **Dual output capture** — need stdout/stderr from Pi execution AND UART output from STM32 | Pi captures its own stdout + reads `/dev/ttyAMA0` for STM32 UART |
-| 7 | **Combined feedback** — both outputs must go into raw_md and back to ChatGPT | Same `append_to_log()` and `build_feedback_prompt()`, just with two sources |
-
-## How Target Identification Works
-
-When ChatGPT responds to a hardware prompt, it typically labels its code blocks clearly:
-
-```markdown
-### Pi Side (`pi_can.py`)
-   ```python
-   import socket
-   ...
-   ```
-
-### STM32 Side (`stm32_main.c`)
-   ```c
-   #include "stm32l4xx_hal.h"
-   ...
-   ```
-```
-
-**Classification rules** (in order of priority):
-
-1. **Filename hint contains target prefix**: `pi_*.py` → Pi, `stm32_*.c` → STM32
-2. **Filename extension**: `.py`, `.sh` → Pi; `.c`, `.h`, `.s`, `.ld` → STM32
-3. **Content heuristics**: `import` at top → Pi; `#include "stm32` → STM32; `HAL_` functions → STM32
-4. **Prompt augmentation**: We tell ChatGPT to name files with prefixes (see prompt template below)
-
-The prompt template forces clear separation:
-
-```
-[HARDWARE CONTEXT]
-You are generating code for TWO targets:
-
-TARGET 1 — Raspberry Pi 5 (Linux, Python 3):
-  - Name all Pi files starting with "pi_" (e.g. pi_can_send.py)
-  - Available: socketCAN, spidev, RPi.GPIO, python3, bash
-  - CAN interface: can0 (MCP2515 on SPI0, 500kbps)
-
-TARGET 2 — STM32L476RG (bare-metal C with HAL):
-  - Name all STM32 files starting with "stm32_" (e.g. stm32_main.c)
-  - Compiler: arm-none-eabi-gcc
-  - UART2 on PA2 TX at 115200 baud for debug output
-  - MUST print status on UART at each stage (init, periph setup, data events)
-
-Return COMPLETE files. Label each file clearly.
-
-[TASK]
-<user prompt here>
-```
-
-## How Remote Execution Works
-
-Everything goes through SSH. The Pi is just a remote machine that runs commands.
-
-```python
-# remote_exec.py — the only new infrastructure file
-
-class RemoteTarget:
-    """SSH/SCP wrapper for the Raspberry Pi."""
-    
-    def __init__(self, host, user, key_path):
-        # Uses subprocess calling ssh/scp (simplest, no paramiko needed)
-    
-    def upload(self, local_path, remote_path):
-        """scp local_path user@host:remote_path"""
-    
-    def run(self, command, timeout=30) -> dict:
-        """ssh user@host 'command' → {stdout, stderr, exit_code}"""
-    
-    def download(self, remote_path, local_path):
-        """scp user@host:remote_path local_path"""
-```
-
-That's it. Three methods. Everything else is just calling `remote.run()` with the right command:
-
-```python
-# Deploy Pi code
-remote.upload("programs/pi_can_send.py", "/home/pi/hw/pi/pi_can_send.py")
-
-# Deploy STM32 code  
-remote.upload("programs/stm32_main.c", "/home/pi/hw/stm32/stm32_main.c")
-
-# Cross-compile STM32 code (on Pi)
-result = remote.run("cd /home/pi/hw/stm32 && arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -o main.elf stm32_main.c startup.s -T stm32l476.ld -lnosys")
-
-# Flash STM32 (from Pi)
-result = remote.run("openocd -f interface/raspberrypi-native.cfg -f target/stm32l4x.cfg -c 'program /home/pi/hw/stm32/main.elf verify reset exit'")
-
-# Run Pi-side script
-result = remote.run("cd /home/pi/hw/pi && python3 pi_can_send.py")
-
-# Capture STM32 UART output
-result = remote.run("timeout 10 cat /dev/ttyAMA0")
-```
-
-## How Dual Output Capture Works
-
-After deployment, we need output from two places:
-
-**Pi execution output**: stdout/stderr from running `pi_can_send.py` — captured directly by `remote.run()`.
-
-**STM32 output**: Whatever the STM32 prints on UART — captured by Pi reading `/dev/ttyAMA0`.
-
-The sequence for a CAN roundtrip test:
-
-```python
-# 1. Start UART listener in background on Pi
-remote.run("timeout 15 cat /dev/ttyAMA0 > /tmp/stm32_uart.log 2>&1 &")
-
-# 2. Small delay for STM32 to boot and print init messages
-time.sleep(2)
-
-# 3. Run Pi-side script (sends CAN frame, maybe also listens)
-pi_result = remote.run("cd /home/pi/hw/pi && python3 pi_can_send.py", timeout=20)
-
-# 4. Grab the STM32 UART log
-remote.download("/tmp/stm32_uart.log", "programs/stm32_uart.log")
-stm32_output = Path("programs/stm32_uart.log").read_text()
-
-# Now we have:
-#   pi_result['stdout']  — what the Pi script printed
-#   pi_result['stderr']  — any Pi-side errors
-#   stm32_output         — what the STM32 printed on UART
-```
-
-Both get appended to the raw_md file:
-
-```python
-append_to_log(raw_md_path, "Pi Execution Output", f"""
-stdout:
-{pi_result['stdout']}
-
-stderr:
-{pi_result['stderr']}
-
-exit code: {pi_result['exit_code']}
-""")
-
-append_to_log(raw_md_path, "STM32 UART Output", f"""
-{stm32_output}
-""")
-```
-
-## How Feedback Works (Same as Before, Just Two Sources)
-
-The feedback prompt sent back to ChatGPT now includes output from both targets:
-
-```python
-def build_hardware_feedback(pi_results, stm32_uart, compile_result, flash_result):
-    lines = []
-    lines.append("The code you generated has issues. Here are the results from BOTH targets:")
-    lines.append("")
-    
-    # Compilation result (if it failed, this is all we need)
-    if not compile_result['success']:
-        lines.append("--- STM32 COMPILATION FAILED ---")
-        lines.append(f"Compiler output:")
-        lines.append(compile_result['stderr'])
-        lines.append("")
-        lines.append("Fix the STM32 code. Return ALL complete files.")
-        return "\n".join(lines)
-    
-    # Flash result
-    if not flash_result['success']:
-        lines.append("--- STM32 FLASH FAILED ---")
-        lines.append(f"OpenOCD output:")
-        lines.append(flash_result['stderr'])
-        lines.append("")
-        lines.append("Fix the issue. Return ALL complete files.")
-        return "\n".join(lines)
-    
-    # Both sides ran — report what happened
-    lines.append("--- Pi execution (pi_can_send.py) ---")
-    if pi_results.get('stderr'):
-        lines.append(f"STDERR: {pi_results['stderr'][:1500]}")
-    if pi_results.get('stdout'):
-        lines.append(f"STDOUT: {pi_results['stdout'][:1500]}")
-    lines.append(f"Exit code: {pi_results.get('exit_code', '?')}")
-    lines.append("")
-    
-    lines.append("--- STM32 UART output (captured from /dev/ttyAMA0) ---")
-    if stm32_uart:
-        lines.append(stm32_uart[:1500])
-    else:
-        lines.append("(no UART output received — STM32 may not be printing, or UART is misconfigured)")
-    lines.append("")
-    
-    lines.append("Fix the code for both targets. Return ALL complete files.")
-    return "\n".join(lines)
-```
-
-This goes straight into `session.followup()` — same multi-turn conversation, same as the existing verify loop.
-
-## Modified Pipeline Flow
-
-The existing `code_skill.py` pipeline becomes:
-
-```
-Step 1: Prompt ChatGPT (same as before)
-Step 2: Extract code blocks (same as before)
-Step 3: Classify blocks → Pi files vs STM32 files (NEW)
-Step 4: Deploy
-         ├─ Pi files:   SCP to Pi, execute, capture stdout/stderr (NEW)
-         └─ STM32 files: SCP to Pi, cross-compile, flash (NEW)
-Step 5: Capture UART from STM32 (NEW)
-Step 6: Append ALL outputs to raw_md (same pattern, new sources)
-Step 7: If failed → build feedback from both targets → followup (same pattern, new content)
-```
-
-Steps 1, 2, 6, 7 are the existing pipeline with minor modifications. Steps 3-5 are new.
-
-## Files
-
-### Existing (unchanged)
-
-| File | Purpose |
-|---|---|
-| `session.py` | Persistent browser wrapper — `prompt()`, `followup()`, `new_chat()` |
-| `chatgpt_skill.py` | Send prompts, extract responses, save to `raw_md/`, `append_to_log()` |
-| `selectors.py` | ChatGPT DOM selectors |
-
-### Existing (modified)
-
-| File | Change |
-|---|---|
-| `code_skill.py` | Add `classify_target()` function. Add `--hardware` flag to pipeline command. When hardware mode is on, use `remote_exec` instead of local `run_file()`. |
-
-### New
-
-| File | Purpose |
-|---|---|
-| `ssh_skill.py` | SSH/SFTP wrapper using paramiko (Windows-compatible). `ssh_run()`, `sftp_upload()`, `sftp_download()`, `deploy_and_run()`. Loads creds from `.env`. |
-| `remote_exec.py` | `RemoteTarget` class -- `upload()`, `run()`, `download()`. ~100 lines. Builds on `ssh_skill.py`. |
-| `.env` | Pi SSH credentials (PI_USER, PI_HOST, PI_PASSWORD). **Gitignored, never committed.** |
-
-That's it -- one new file of substance (`remote_exec.py`) and a config file.
+Replace "raspi" with "local" and step 7 becomes local execution instead.
 
 ## Directory Structure
 
 ```
 verifybot/
-├── chatgpt_skill.py          # Browser automation (existing)
-├── session.py                 # Persistent browser session (existing)
-├── selectors.py               # DOM selectors (existing)
-├── code_skill.py              # Code extraction + pipeline (existing, extended)
-├── ssh_skill.py               # [NEW] SSH/SFTP via paramiko, deploy_and_run()
-├── remote_exec.py             # [TODO] RemoteTarget class, builds on ssh_skill
-├── .env                       # [NEW] Pi creds (gitignored, NEVER committed)
-├── raw_md/                    # Pipeline history (existing)
-├── programs/                  # Extracted code (existing)
-└── .browser_profile/          # Browser cookies (existing)
+|-- scheduler.py               # Entry point -- run everything from here
+|-- core/                      # Infrastructure (things skills depend on)
+|   |-- __init__.py            # Required for Python package imports
+|   |-- selectors.py           # ChatGPT DOM selectors
+|   +-- session.py             # Persistent browser session
+|-- skills/                    # All skill modules
+|   |-- __init__.py            # Required for Python package imports
+|   |-- chatgpt_skill.py      # Browser automation, raw_md saving
+|   |-- code_skill.py         # Code extraction, execution, verification
+|   +-- ssh_skill.py          # SSH/SFTP to Raspberry Pi
+|-- .env                       # Pi SSH credentials (gitignored)
+|-- .gitignore
+|-- LLM.md                     # This file
+|-- raw_md/                    # Pipeline run transcripts
+|-- programs/                  # Extracted code (cleared between runs)
++-- .browser_profile/          # Browser cookies (persistent login)
 
 On the Raspberry Pi:
-/home/pi/hw/
-├── pi/                        # Pi-side scripts land here
-├── stm32/                     # STM32 source + build artifacts
-│   ├── startup.s              # Pre-staged startup assembly
-│   ├── stm32l476.ld           # Pre-staged linker script
-│   ├── Makefile               # Pre-staged Makefile template
-│   └── cmsis/                 # Pre-staged HAL/CMSIS headers
-└── logs/                      # UART captures, test logs
+/home/scoobyxd/Documents/      # Default deploy target for Pi scripts
+/home/scoobyxd/hw/             # Future: hardware project workspace
+|-- pi/                        # Pi-side scripts
+|-- stm32/                     # STM32 source + build artifacts
++-- logs/                      # UART captures, test logs
 ```
+
+## Files
+
+### core/ -- Infrastructure (things skills depend on)
+
+| File | Purpose |
+|---|---|
+| `core/__init__.py` | Makes core/ a Python package (required for imports to work) |
+| `core/selectors.py` | ChatGPT DOM selectors -- centralized so when ChatGPT changes its frontend, you update one file |
+| `core/session.py` | Persistent browser session -- `prompt()`, `followup()`, `new_chat()` |
+
+### skills/ -- All skill modules
+
+| File | Purpose |
+|---|---|
+| `skills/__init__.py` | Makes skills/ a Python package (required for imports to work) |
+| `skills/chatgpt_skill.py` | Browser automation: send prompts, save responses to raw_md/, append_to_log() |
+| `skills/code_skill.py` | Code extraction from markdown, compilation, local execution, verification loop, feedback prompts |
+| `skills/ssh_skill.py` | SSH/SFTP to Raspberry Pi via paramiko. ssh_run(), sftp_upload(), sftp_download(). Loads creds from .env |
+
+### Root
+
+| File | Purpose |
+|---|---|
+| `scheduler.py` | Entry point. prompt -> ChatGPT -> extract -> filter -> classify -> execute. Browser visible and auto-retry on by default. |
+| `.env` | Pi SSH credentials (PI_USER, PI_HOST, PI_PASSWORD). Gitignored, never committed. |
+| `.gitignore` | Keeps secrets, caches, and generated files out of git |
+| `LLM.md` | This file |
+
+### Why __init__.py?
+
+Python needs a file called `__init__.py` inside a folder to treat it as an importable package. Without it, `from core.session import ChatGPTSession` fails with ModuleNotFoundError. They are one-line files with just a comment. You never edit them.
+
+## Import Map
+
+How modules depend on each other (arrows = "imports from"):
+
+```
+scheduler.py
+  |-- core.session          (ChatGPTSession)
+  |-- skills.code_skill     (extract, save, run, feedback)
+  |-- skills.chatgpt_skill  (ensure_dirs)
+  +-- skills.ssh_skill      (ssh_run, sftp_upload)
+
+skills/chatgpt_skill.py
+  |-- core.selectors
+  +-- core.session
+
+skills/code_skill.py
+  |-- skills.chatgpt_skill  (lazy import inside cmd_pipeline only)
+  +-- core.session           (lazy import inside cmd_pipeline only)
+
+core/session.py
+  +-- core.selectors
+
+core/selectors.py
+  (no internal imports)
+
+skills/ssh_skill.py
+  (no internal imports, reads .env from project root)
+```
+
+## Target Classification
+
+The scheduler auto-detects where code should run:
+
+**From prompt keywords** (strongest signal):
+- RASPI: "raspi", "raspberry pi", "pi5", "gpio", "i2c", "spi", "uart", "can bus",
+  "sensor", "motor", "imu", "stm32", "embedded", "hardware", "remote"
+- LOCAL: "local", "locally", "this machine", "my computer", "my laptop", "windows", "here"
+
+**From code content** (after extraction):
+- Pi patterns: `import RPi`, `import spidev`, GPIO references, /dev/tty*, HAL includes
+
+**From filenames**: pi_*.py, stm32_*.c -> raspi
+
+**Override**: `--target local` or `--target raspi` skips auto-detection.
+
+## Junk Block Filtering
+
+ChatGPT responses often include non-program code blocks:
+- One-liner bash: `python3 script.py` (just showing how to run it)
+- Example output: `Execution host: raspberrypi5` (showing what output looks like)
+- yaml/txt blocks that are illustrations, not code
+
+The scheduler filters these out before saving/executing. Only real programs with actual logic get kept. Safety net: if ALL blocks get filtered, keeps the largest one.
 
 ## Usage
 
 ```bash
-# Existing commands still work for local-only tasks:
-python code_skill.py pipeline "write a fizzbuzz in C" --verify
+# Typical -- just a prompt, everything else is automatic
+# (browser visible, auto-retry on, target auto-detected)
+python scheduler.py "make a random word generator that saves to a text file in raspi"
+python scheduler.py "make a fizzbuzz program for local"
 
-# NEW: Hardware pipeline
-python code_skill.py pipeline "SPI to CAN bus between raspi and stm32" --hardware --verify
+# Force target
+python scheduler.py "write a sorting algorithm" --target local
+python scheduler.py "blink an LED" --target raspi
 
-# NEW: Hardware pipeline with more retries
-python code_skill.py pipeline "STM32 reads IMU over I2C and prints to UART" --hardware --verify --max-retries 5
+# Hide browser (run unattended)
+python scheduler.py "make a word counter for raspi" --headless
+
+# Disable auto-retry
+python scheduler.py "hello world for local" --no-verify
+
+# More retries, longer timeout
+python scheduler.py "stress test for raspi" --max-retries 5 --timeout 120
+
+# Just extract code, don't run it
+python scheduler.py "write a CAN bus listener for raspi" --no-run
+
+# SSH skill standalone
+python skills/ssh_skill.py --test
+python skills/ssh_skill.py --run "ls -la ~/Documents"
+python skills/ssh_skill.py --deploy programs/word_generator.py
+```
+
+## CLI Flags
+
+| Flag | Default | What it does |
+|------|---------|--------------|
+| `"prompt"` | (required) | Your natural language prompt in quotes |
+| `--target local/raspi` | auto-detect | Force where code runs |
+| `--headless` | OFF (browser visible) | Hide the browser window |
+| `--no-verify` | OFF (verify ON) | Disable auto-retry on failure |
+| `--max-retries N` | 3 | How many times to retry on failure |
+| `--no-run` | OFF (runs code) | Just extract code, don't execute |
+| `--dest ./folder` | programs/ | Where to save extracted code locally |
+| `--remote-dir /path` | ~/Documents | Where files go on the Pi |
+| `--timeout N` | 30 | Seconds per file before killing execution |
+
+## Dependencies
+
+**Python packages** (install on your Windows laptop):
+```
+pip install playwright paramiko
+playwright install chromium
+```
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| playwright | latest | Browser automation for ChatGPT |
+| paramiko | latest | SSH/SFTP to Raspberry Pi (pure Python, Windows-compatible) |
+
+**On the Raspberry Pi** (do once):
+```bash
+sudo apt install gcc-arm-none-eabi openocd can-utils
 ```
 
 ## Build Order
 
 ### Phase 0: SSH basics (COMPLETE)
-1. `ssh_skill.py` with `ssh_run()`, `sftp_upload()`, `sftp_download()`, `deploy_and_run()`
-2. `.env` for credentials (gitignored)
-3. Tested: `--test` creates file on Pi, `--deploy` uploads + runs script + script saves own results on Pi
-4. Uses paramiko (pure Python, works on Windows)
+1. ssh_skill.py with ssh_run(), sftp_upload(), sftp_download(), deploy_and_run()
+2. .env for credentials (gitignored)
+3. Uses paramiko (pure Python, works on Windows)
 
-### Phase 1: Remote execution basics
-1. Write `remote_exec.py` with `upload()`, `run()`, `download()` -- wraps ssh_skill functions into RemoteTarget class
-2. Test: upload a "hello world" Python script to Pi, run it, get "hello" back
+### Phase 0.5: Unified scheduler (COMPLETE)
+1. scheduler.py -- single entry point for all pipelines
+2. classify_target() -- auto-detects local vs raspi from prompt, code, filenames
+3. Junk block filtering -- skips example output and run commands
+4. Smart filenames -- derives from prompt instead of program_0.py
+5. PipelineLogger -- terminal output mirrored in raw_md transcript
+6. Folder reorganization: core/ for infrastructure, skills/ for all skills
 
-### Phase 2: Target classification
-4. Add `classify_target()` to `code_skill.py` — takes a `CodeBlock` + filename hint, returns `"pi"` or `"stm32"` or `"local"`
-5. Test: extract blocks from a mock two-target response, verify correct classification
+### Phase 1: Testing and iteration
+1. Test scheduler end-to-end with various prompts
+2. Tune classify_target() and junk filter as edge cases appear
+
+### Phase 2: Target classification for multi-file responses
+3. Handle responses with both Pi and STM32 code blocks
+4. Route different files to different targets from same prompt
 
 ### Phase 3: Cross-compile + flash
-6. Pre-stage STM32 support files on Pi (linker script, startup, CMSIS headers, Makefile)
-7. Add compile + flash commands to the pipeline via `remote.run()`
-8. Test: send a minimal STM32 C file, compile on Pi, flash, read UART "hello" back
+5. Pre-stage STM32 support files on Pi (linker script, startup, CMSIS headers)
+6. Add compile + flash commands via ssh_run()
+7. Test: send minimal STM32 C file, compile on Pi, flash, read UART output
 
-### Phase 4: Full loop
-9. Add `--hardware` flag to `cmd_pipeline()`
-10. Add dual output capture (Pi stdout + STM32 UART)
-11. Add `build_hardware_feedback()` for the retry loop
-12. Test: run the full CAN roundtrip end-to-end
+### Phase 4: Full dual-target loop
+8. Dual output capture (Pi stdout + STM32 UART)
+9. Combined feedback prompt for retry loop
+10. Test: full CAN roundtrip end-to-end
 
-## Prerequisites
+## Changelog
 
-**On your laptop** (already have most of this):
-```
-pip install playwright
-playwright install chromium
-```
+### 2026-02-13 v0.4 -- Folder reorganization
+- Moved selectors.py and session.py into core/ (infrastructure)
+- Moved chatgpt_skill.py, code_skill.py, ssh_skill.py into skills/
+- scheduler.py stays at root as the entry point
+- All imports updated, __init__.py files added
+- All Path references use .resolve().parent.parent to find project root
 
-**On the Raspberry Pi** (do once):
-```bash
-sudo apt install gcc-arm-none-eabi openocd can-utils
-# Set up SSH key auth from laptop
-# MCP2515 overlay in /boot/firmware/config.txt
-# Enable UART
-# Create /home/pi/hw/stm32/ with support files
-```
+### 2026-02-13 v0.3 -- Scheduler improvements
+- Junk block filtering: filters out one-liner bash run commands and example output blocks
+- Smart filenames: extracted files named from prompt context, not program_0.py
+- Terminal-mirroring MD logs: raw_md is now an ordered transcript of the run
+- PipelineLogger: dual-output logger (terminal + md file simultaneously)
+- Flipped defaults: browser visible and auto-retry ON by default
 
-**Physical wiring** (do once, verify manually before automating):
-- MCP2515 #1 ↔ Pi SPI0, MCP2515 #2 ↔ STM32 SPI1, CAN_H↔CAN_H, CAN_L↔CAN_L
-- STM32 PA2 (UART TX) → Pi UART RX
-- STM32 SWD ↔ Pi GPIOs (or ST-Link on Pi USB)
-- 120Ω termination resistors on CAN bus
+### 2026-02-13 v0.2 -- Unified scheduler
+- scheduler.py single entry point
+- Auto-detects local vs raspi target
+- Target-aware prompt prefixes and feedback prompts
 
----
+### 2026-02-13 v0.1 -- SSH basics
+- ssh_skill.py with paramiko
+- .env for credentials
+- deploy_and_run() for remote execution
 
-No frameworks. No agents. No LangChain. Same scripts as before, plus SSH.
+## Notes
 
-
-### Notes
 1. NO EMOJIS anywhere -- Linux terminal and STM32 UART cannot process/print Unicode emoji encodings. Use ASCII only in all generated code, output, and log files.
-2. SSH credentials live in `.env` (gitignored). Never hardcode creds in scripts.
-3. `ssh_skill.py` uses paramiko (pure Python) instead of sshpass -- works on Windows.
+2. SSH credentials live in .env (gitignored). Never hardcode creds in scripts.
+3. ssh_skill.py uses paramiko (pure Python) instead of sshpass -- works on Windows.
+4. The junk block filter uses heuristics. If a real program gets filtered, the safety net keeps the largest block. May need tuning over time.
+5. __init__.py files are required in core/ and skills/ for Python package imports. They are one-line comment files. Do not delete them.

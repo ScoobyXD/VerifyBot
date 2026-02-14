@@ -24,9 +24,9 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright, Playwright, BrowserContext, Page
 
-import selectors as S
+from core import selectors as S
 
-PROFILE_DIR = Path(__file__).parent / ".browser_profile"
+PROFILE_DIR = Path(__file__).resolve().parent.parent / ".browser_profile"
 
 
 class ChatGPTSession:
