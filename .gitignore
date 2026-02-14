@@ -13,3 +13,5 @@ programs/
 # Local secrets / credentials
 .secrets/
 
+.env
+.env.*
