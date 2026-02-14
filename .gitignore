@@ -8,8 +8,8 @@ __pycache__/
 # Raw ChatGPT responses
 raw_md/
 
-# The Extracted Code
+# Extracted code
 programs/
 
-# Secrets -- SSH credentials, API keys, etc.
+# Secrets -- SSH credentials, API keys
 .env

@@ -36,8 +36,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-PROGRAMS_DIR = Path(__file__).parent / "programs"
-RAW_MD_DIR = Path(__file__).parent / "raw_md"
+PROGRAMS_DIR = Path(__file__).resolve().parent.parent / "programs"
+RAW_MD_DIR = Path(__file__).resolve().parent.parent / "raw_md"
 
 # ---------------------------------------------------------------------------
 # Code block extraction
@@ -823,8 +823,8 @@ def cmd_pipeline(prompt: str, dest: str = None, run: bool = True,
     All activity (prompts, responses, extraction, compilation, execution,
     feedback) is logged into the raw_md file for full audit trail.
     """
-    from chatgpt_skill import save_response, append_to_log, ensure_dirs
-    from session import ChatGPTSession
+    from skills.chatgpt_skill import save_response, append_to_log, ensure_dirs
+    from core.session import ChatGPTSession
 
     ensure_dirs()
     dest_dir = Path(dest) if dest else PROGRAMS_DIR

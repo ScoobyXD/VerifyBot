@@ -18,13 +18,13 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-import selectors as S
-from session import ChatGPTSession
+from core import selectors as S
+from core.session import ChatGPTSession
 
 # --- Config ---
-PROFILE_DIR = Path(__file__).parent / ".browser_profile"
-RAW_MD_DIR = Path(__file__).parent / "raw_md"
-PROGRAMS_DIR = Path(__file__).parent / "programs"
+PROFILE_DIR = Path(__file__).resolve().parent.parent / ".browser_profile"
+RAW_MD_DIR = Path(__file__).resolve().parent.parent / "raw_md"
+PROGRAMS_DIR = Path(__file__).resolve().parent.parent / "programs"
 
 
 def ensure_dirs():

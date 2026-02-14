@@ -6,23 +6,9 @@ Loads credentials from .env (PI_USER, PI_HOST, PI_PASSWORD).
 Uses paramiko -- pure Python SSH, works on Windows/Mac/Linux.
 
 Usage:
-    # Quick test: create a file on Pi proving SSH works
-    python ssh_skill.py --test
-
-    # Deploy a script to Pi, run it remotely, results saved ON the Pi
-    python ssh_skill.py --deploy programs/word_generator.py
-
-    # Deploy to a custom remote directory
-    python ssh_skill.py --deploy programs/word_generator.py --remote-dir /home/scoobyxd/hw/pi
-
-    # Run an arbitrary command on Pi
-    python ssh_skill.py --run "ls -la ~/Documents"
-
-    # Upload a file
-    python ssh_skill.py --upload local.txt /home/scoobyxd/Documents/local.txt
-
-    # Download a file
-    python ssh_skill.py --download /home/scoobyxd/Documents/remote.txt ./remote.txt
+    python -m skills.ssh_skill --test
+    python -m skills.ssh_skill --run "ls -la ~/Documents"
+    python -m skills.ssh_skill --deploy programs/word_generator.py
 
 Requires: pip install paramiko
 """
@@ -43,7 +29,7 @@ except ImportError:
 # Load .env
 # ---------------------------------------------------------------------------
 
-ENV_FILE = Path(__file__).parent / ".env"
+ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 def load_env():
@@ -150,7 +136,14 @@ def sftp_download(remote_path: str, local_path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Test -- prove SSH works by creating a .md file on Pi
+# Constants
+# ---------------------------------------------------------------------------
+
+REMOTE_WORK_DIR = "/home/scoobyxd/Documents"
+
+
+# ---------------------------------------------------------------------------
+# Test
 # ---------------------------------------------------------------------------
 
 def run_test():
@@ -160,7 +153,7 @@ def run_test():
     print("=" * 50)
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    remote_path = "/home/scoobyxd/Documents/ssh_test.md"
+    remote_path = f"{REMOTE_WORK_DIR}/ssh_test.md"
 
     md_content = (
         f"# SSH Test\n\n"
@@ -170,7 +163,7 @@ def run_test():
 
     escaped = md_content.replace("'", "'\\''")
     cmd = (
-        f"mkdir -p /home/scoobyxd/Documents && "
+        f"mkdir -p {REMOTE_WORK_DIR} && "
         f"printf '%s' '{escaped}' > {remote_path} && "
         f"echo 'File written successfully' && "
         f"cat {remote_path}"
@@ -192,30 +185,12 @@ def run_test():
 
 
 # ---------------------------------------------------------------------------
-# Deploy & Run -- upload a script, execute it ON the Pi, results stay on Pi
+# Deploy & Run
 # ---------------------------------------------------------------------------
-
-REMOTE_WORK_DIR = "/home/scoobyxd/Documents"
-
 
 def deploy_and_run(local_script: str, remote_dir: str = None,
                    timeout: int = 30) -> dict:
-    """Upload a script to Pi, run it there. The script saves its own results on Pi.
-
-    Full pipeline:
-      1. SFTP upload local_script -> Pi remote_dir/
-      2. SSH execute: python3 <script>  (on the Pi)
-      3. Print stdout/stderr from remote execution
-      4. Verify the result file was created on Pi
-
-    Args:
-        local_script: Path to local .py file to deploy
-        remote_dir:   Remote directory on Pi (default: ~/Documents)
-        timeout:      Execution timeout in seconds
-
-    Returns:
-        dict with stdout, stderr, exit_code, success, remote_path
-    """
+    """Upload a script to Pi, run it there. The script saves its own results on Pi."""
     local_path = Path(local_script)
     if not local_path.exists():
         print(f"[ERROR] File not found: {local_path}")
@@ -224,18 +199,15 @@ def deploy_and_run(local_script: str, remote_dir: str = None,
     rdir = remote_dir or REMOTE_WORK_DIR
     remote_path = f"{rdir}/{local_path.name}"
 
-    # Step 1: Ensure remote dir exists
     print(f"[1/4] Creating remote directory: {rdir}")
     ssh_run(f"mkdir -p {rdir}")
 
-    # Step 2: Upload
     print(f"[2/4] Uploading {local_path.name} -> Pi:{remote_path}")
     up = sftp_upload(str(local_path), remote_path)
     if not up["success"]:
         print(f"[FAIL] Upload failed: {up['stderr']}")
         return up
 
-    # Step 3: Execute remotely
     print(f"[3/4] Executing on Pi: python3 {local_path.name}")
     result = ssh_run(f"cd {rdir} && python3 {local_path.name}", timeout=timeout)
     result["remote_path"] = remote_path
@@ -252,7 +224,6 @@ def deploy_and_run(local_script: str, remote_dir: str = None,
         print(f"\n--- Pi stderr ---")
         print(result["stderr"])
 
-    # Step 4: Verify result file exists on Pi
     print(f"[4/4] Checking for result files on Pi...")
     verify = ssh_run(f"ls -la {rdir}/*result* 2>/dev/null || echo '(no result files found)'")
     print(verify["stdout"].strip())
@@ -267,29 +238,26 @@ def deploy_and_run(local_script: str, remote_dir: str = None,
 def main():
     parser = argparse.ArgumentParser(description="SSH Skill -- Run commands on Raspberry Pi")
     parser.add_argument("--test", action="store_true",
-                        help="Create a test .md file on the Pi to prove SSH works")
+                        help="Create a test .md file on the Pi")
     parser.add_argument("--run", type=str,
                         help="Run an arbitrary command on the Pi")
     parser.add_argument("--upload", nargs=2, metavar=("LOCAL", "REMOTE"),
-                        help="Upload a file: --upload local.txt /remote/path.txt")
+                        help="Upload a file")
     parser.add_argument("--download", nargs=2, metavar=("REMOTE", "LOCAL"),
-                        help="Download a file: --download /remote/path.txt local.txt")
+                        help="Download a file")
     parser.add_argument("--deploy", type=str, metavar="SCRIPT",
-                        help="Upload a .py script to Pi, run it there, results saved on Pi")
+                        help="Upload + run a .py script on Pi")
     parser.add_argument("--remote-dir", type=str, default=None,
-                        help="Remote directory for --deploy (default: ~/Documents)")
+                        help="Remote directory (default: ~/Documents)")
     parser.add_argument("--timeout", type=int, default=30,
-                        help="Command timeout in seconds (default: 30)")
+                        help="Timeout in seconds (default: 30)")
 
     args = parser.parse_args()
 
     if args.test:
         run_test()
     elif args.deploy:
-        result = deploy_and_run(args.deploy, remote_dir=args.remote_dir,
-                                timeout=args.timeout)
-        if not result["success"]:
-            sys.exit(1)
+        deploy_and_run(args.deploy, remote_dir=args.remote_dir, timeout=args.timeout)
     elif args.run:
         result = ssh_run(args.run, timeout=args.timeout)
         print(result["stdout"])
@@ -298,16 +266,10 @@ def main():
         sys.exit(result["exit_code"] if result["exit_code"] >= 0 else 1)
     elif args.upload:
         result = sftp_upload(args.upload[0], args.upload[1])
-        if result["success"]:
-            print(f"[OK] Uploaded {args.upload[0]} -> {args.upload[1]}")
-        else:
-            print(f"[FAIL] {result['stderr']}")
+        print(f"[OK] Uploaded" if result["success"] else f"[FAIL] {result['stderr']}")
     elif args.download:
         result = sftp_download(args.download[0], args.download[1])
-        if result["success"]:
-            print(f"[OK] Downloaded {args.download[0]} -> {args.download[1]}")
-        else:
-            print(f"[FAIL] {result['stderr']}")
+        print(f"[OK] Downloaded" if result["success"] else f"[FAIL] {result['stderr']}")
     else:
         parser.print_help()
 
