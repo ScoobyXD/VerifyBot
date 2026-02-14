@@ -10,3 +10,6 @@ raw_md/
 
 # The Extracted Code
 programs/
+
+# Secrets -- SSH credentials, API keys, etc.
+.env

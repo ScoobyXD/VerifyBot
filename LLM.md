@@ -316,10 +316,11 @@ Steps 1, 2, 6, 7 are the existing pipeline with minor modifications. Steps 3-5 a
 
 | File | Purpose |
 |---|---|
-| `remote_exec.py` | `RemoteTarget` class — `upload()`, `run()`, `download()`. ~100 lines. |
-| `pi_config.yaml` | Pi hostname/IP, SSH user, key path, remote working directories, UART port, CAN interface. |
+| `ssh_skill.py` | SSH/SFTP wrapper using paramiko (Windows-compatible). `ssh_run()`, `sftp_upload()`, `sftp_download()`, `deploy_and_run()`. Loads creds from `.env`. |
+| `remote_exec.py` | `RemoteTarget` class -- `upload()`, `run()`, `download()`. ~100 lines. Builds on `ssh_skill.py`. |
+| `.env` | Pi SSH credentials (PI_USER, PI_HOST, PI_PASSWORD). **Gitignored, never committed.** |
 
-That's it — one new file of substance (`remote_exec.py`) and a config file.
+That's it -- one new file of substance (`remote_exec.py`) and a config file.
 
 ## Directory Structure
 
@@ -329,8 +330,9 @@ verifybot/
 ├── session.py                 # Persistent browser session (existing)
 ├── selectors.py               # DOM selectors (existing)
 ├── code_skill.py              # Code extraction + pipeline (existing, extended)
-├── remote_exec.py             # [NEW] SSH/SCP to Pi (~100 lines)
-├── pi_config.yaml             # [NEW] Pi connection config
+├── ssh_skill.py               # [NEW] SSH/SFTP via paramiko, deploy_and_run()
+├── remote_exec.py             # [TODO] RemoteTarget class, builds on ssh_skill
+├── .env                       # [NEW] Pi creds (gitignored, NEVER committed)
 ├── raw_md/                    # Pipeline history (existing)
 ├── programs/                  # Extracted code (existing)
 └── .browser_profile/          # Browser cookies (existing)
@@ -361,10 +363,15 @@ python code_skill.py pipeline "STM32 reads IMU over I2C and prints to UART" --ha
 
 ## Build Order
 
+### Phase 0: SSH basics (COMPLETE)
+1. `ssh_skill.py` with `ssh_run()`, `sftp_upload()`, `sftp_download()`, `deploy_and_run()`
+2. `.env` for credentials (gitignored)
+3. Tested: `--test` creates file on Pi, `--deploy` uploads + runs script + script saves own results on Pi
+4. Uses paramiko (pure Python, works on Windows)
+
 ### Phase 1: Remote execution basics
-1. Write `remote_exec.py` with `upload()`, `run()`, `download()`
-2. Write `pi_config.yaml`
-3. Test: upload a "hello world" Python script to Pi, run it, get "hello" back
+1. Write `remote_exec.py` with `upload()`, `run()`, `download()` -- wraps ssh_skill functions into RemoteTarget class
+2. Test: upload a "hello world" Python script to Pi, run it, get "hello" back
 
 ### Phase 2: Target classification
 4. Add `classify_target()` to `code_skill.py` — takes a `CodeBlock` + filename hint, returns `"pi"` or `"stm32"` or `"local"`
@@ -407,3 +414,9 @@ sudo apt install gcc-arm-none-eabi openocd can-utils
 ---
 
 No frameworks. No agents. No LangChain. Same scripts as before, plus SSH.
+
+
+### Notes
+1. NO EMOJIS anywhere -- Linux terminal and STM32 UART cannot process/print Unicode emoji encodings. Use ASCII only in all generated code, output, and log files.
+2. SSH credentials live in `.env` (gitignored). Never hardcode creds in scripts.
+3. `ssh_skill.py` uses paramiko (pure Python) instead of sshpass -- works on Windows.
