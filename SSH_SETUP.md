@@ -7,6 +7,7 @@ create a simple markdown file on your Raspberry Pi over SSH.
 
 1. Copy `pi_ssh.env.example` to `.secrets/pi_ssh.env`
 2. Fill in `PI_HOST`, `PI_USER`, `PI_PASSWORD`
+   - `PI_HOST` can be either `ScoobyXD` or `scoobyxd@ScoobyXD`
 
 `.secrets/` is ignored by git so credentials are not committed.
 
@@ -34,5 +35,7 @@ python pi_ssh_bootstrap.py \
 
 ## Notes
 
-- If using password auth, the script expects `sshpass` to be installed.
+- On Linux/macOS, password auth uses `sshpass` when available.
+- On Windows (or any machine without `sshpass`), the script falls back to normal `ssh` and prompts for password interactively.
 - If you already have SSH keys set up, omit password and key auth will be used.
+- If hostname discovery fails, use your Pi IP address in `PI_HOST` (for example `192.168.x.x`).
