@@ -8,6 +8,7 @@ to validate SSH connectivity and remote file-write behavior.
 import argparse
 import importlib.util
 import os
+import platform
 import shutil
 import sys
 import sysconfig
@@ -50,6 +51,21 @@ def resolve_value(cli_val: str | None, env_key: str, loaded: dict) -> str | None
     return loaded.get(env_key)
 
 
+
+
+def normalize_target(host: str, user: str) -> tuple[str, str]:
+    """Support host values passed as either host or user@host."""
+    if "@" not in host:
+        return host, user
+
+    parsed_user, parsed_host = host.split("@", 1)
+    if not user:
+        return parsed_host, parsed_user
+    if user != parsed_user:
+        print(f"[WARN] Host included user '{parsed_user}', overriding explicit user '{user}'.")
+        return parsed_host, parsed_user
+    return parsed_host, user
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Create a test markdown file on Raspberry Pi over SSH")
     p.add_argument("--secrets-file", default=".secrets/pi_ssh.env", help="Path to ignored credential file")
@@ -73,6 +89,8 @@ def main() -> int:
         print("[ERROR] Missing PI host/user. Set in CLI args, env, or secrets file.")
         return 2
 
+    host, user = normalize_target(host, user)
+
     remote_path = args.remote_path
     if not remote_path.startswith("/"):
         remote_path = f"~/{remote_path}"
@@ -89,18 +107,26 @@ def main() -> int:
     ]
 
     if password:
-        if not shutil.which("sshpass"):
-            print("[ERROR] Password provided but sshpass is not installed.")
-            print("        Install sshpass or configure SSH keys and rerun without --password.")
-            return 3
-        ssh_cmd = ["sshpass", "-p", password] + ssh_cmd
+        sshpass_path = shutil.which("sshpass")
+        if sshpass_path:
+            ssh_cmd = ["sshpass", "-p", password] + ssh_cmd
+        else:
+            print("[WARN] sshpass not found; falling back to interactive SSH password prompt.")
+            print("       This is expected on Windows unless sshpass is installed.")
+            print("       When prompted by ssh, paste your Pi password manually.")
 
     print(f"[SSH] Writing markdown file to {user}@{host}:{remote_path}")
-    result = subprocess.run(ssh_cmd, input=args.message, text=True, capture_output=True)
+    capture = platform.system().lower() != "windows"
+    result = subprocess.run(
+        ssh_cmd,
+        input=args.message,
+        text=True,
+        capture_output=capture,
+    )
 
     if result.returncode != 0:
         print("[FAIL] SSH write failed")
-        if result.stderr.strip():
+        if capture and result.stderr.strip():
             print(result.stderr.strip())
         return result.returncode
 
