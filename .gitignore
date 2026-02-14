@@ -10,8 +10,3 @@ raw_md/
 
 # The Extracted Code
 programs/
-# Local secrets / credentials
-.secrets/
-
-.env
-.env.*
