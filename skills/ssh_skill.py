@@ -16,6 +16,8 @@ Requires: pip install paramiko
 import argparse
 import os
 import sys
+import time
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -72,19 +74,84 @@ def _connect() -> paramiko.SSHClient:
 
 
 def ssh_run(command: str, timeout: int = 30) -> dict:
-    """Run a command on the Pi via SSH. Returns {stdout, stderr, exit_code, success}."""
+    """Run a command on the Pi via SSH. Returns {stdout, stderr, exit_code, success, timed_out}.
+
+    IMPORTANT: This function properly enforces the timeout. If the command takes
+    longer than `timeout` seconds, it returns with timed_out=True and whatever
+    partial output was captured. The remote process is NOT killed (it keeps running
+    on the Pi) -- use ssh_run_detached() for fire-and-forget commands.
+    """
     try:
         client = _connect()
-        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-        exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
+        transport = client.get_transport()
+        channel = transport.open_session()
+        channel.settimeout(timeout)
+        channel.exec_command(command)
+
+        # Wait for exit status with timeout using a background thread
+        exit_code = [None]
+        timed_out = [False]
+
+        def wait_for_exit():
+            try:
+                exit_code[0] = channel.recv_exit_status()
+            except Exception:
+                pass
+
+        waiter = threading.Thread(target=wait_for_exit, daemon=True)
+        waiter.start()
+        waiter.join(timeout=timeout)
+
+        if waiter.is_alive():
+            # Command is still running -- timed out
+            timed_out[0] = True
+            # Read whatever partial output is available
+            out = ""
+            err = ""
+            try:
+                if channel.recv_ready():
+                    out = channel.recv(65536).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            try:
+                if channel.recv_stderr_ready():
+                    err = channel.recv_stderr(65536).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            try:
+                channel.close()
+            except Exception:
+                pass
+            client.close()
+            return {
+                "stdout": out,
+                "stderr": err,
+                "exit_code": -1,
+                "success": False,
+                "timed_out": True,
+            }
+
+        # Command finished within timeout
+        out = ""
+        err = ""
+        try:
+            out = channel.recv(10 * 1024 * 1024).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        try:
+            err = channel.recv_stderr(10 * 1024 * 1024).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        channel.close()
         client.close()
+
+        ec = exit_code[0] if exit_code[0] is not None else -1
         return {
             "stdout": out,
             "stderr": err,
-            "exit_code": exit_code,
-            "success": exit_code == 0,
+            "exit_code": ec,
+            "success": ec == 0,
+            "timed_out": False,
         }
     except paramiko.AuthenticationException:
         return {
@@ -92,6 +159,7 @@ def ssh_run(command: str, timeout: int = 30) -> dict:
             "stderr": "[ERROR] Authentication failed -- check PI_USER/PI_PASSWORD in .env",
             "exit_code": -1,
             "success": False,
+            "timed_out": False,
         }
     except paramiko.SSHException as e:
         return {
@@ -99,6 +167,7 @@ def ssh_run(command: str, timeout: int = 30) -> dict:
             "stderr": f"[ERROR] SSH error: {e}",
             "exit_code": -1,
             "success": False,
+            "timed_out": False,
         }
     except Exception as e:
         return {
@@ -106,7 +175,25 @@ def ssh_run(command: str, timeout: int = 30) -> dict:
             "stderr": f"[ERROR] Connection failed: {e}",
             "exit_code": -1,
             "success": False,
+            "timed_out": False,
         }
+
+
+def ssh_run_detached(command: str) -> dict:
+    """Run a command on the Pi that may run forever. Fire and forget.
+
+    Uses nohup + & to detach the process. Returns immediately.
+    The command continues running on the Pi after SSH disconnects.
+    """
+    # Wrap in nohup, redirect output, background it
+    wrapped = f"nohup {command} > /dev/null 2>&1 & echo $!"
+    result = ssh_run(wrapped, timeout=10)
+    pid = result.get("stdout", "").strip()
+    return {
+        "success": result["success"],
+        "pid": pid,
+        "stderr": result.get("stderr", ""),
+    }
 
 
 def sftp_upload(local_path: str, remote_path: str) -> dict:
@@ -212,7 +299,9 @@ def deploy_and_run(local_script: str, remote_dir: str = None,
     result = ssh_run(f"cd {rdir} && python3 {local_path.name}", timeout=timeout)
     result["remote_path"] = remote_path
 
-    if result["success"]:
+    if result.get("timed_out"):
+        print(f"[WARN] Execution timed out after {timeout}s (process may still be running on Pi)")
+    elif result["success"]:
         print(f"[OK] Execution succeeded (exit code 0)")
     else:
         print(f"[WARN] Execution finished with exit code {result['exit_code']}")
@@ -263,6 +352,8 @@ def main():
         print(result["stdout"])
         if result["stderr"]:
             print(result["stderr"], file=sys.stderr)
+        if result.get("timed_out"):
+            print("[WARN] Command timed out", file=sys.stderr)
         sys.exit(result["exit_code"] if result["exit_code"] >= 0 else 1)
     elif args.upload:
         result = sftp_upload(args.upload[0], args.upload[1])
