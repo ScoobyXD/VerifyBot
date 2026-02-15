@@ -50,6 +50,7 @@ from acceptance import (
     run_acceptance_tests,
     format_test_failures_for_feedback,
 )
+from terminal_loop import run_terminal_loop, should_use_terminal_loop
 
 
 # ---------------------------------------------------------------------------
@@ -663,24 +664,39 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
     # [v0.7] Detect long-running tasks (infinite loops, daemons, servers)
     long_running = is_long_running_task(prompt)
 
+    # [v0.8] Detect terminal tasks (kill, stop, check status, install)
+    use_terminal = (
+        resolved_target == "raspi"
+        and run
+        and should_use_terminal_loop(prompt)
+    )
+
     # Banner
     log.section("Pipeline Start")
     log.log(f"[TARGET] {target_display(resolved_target)}")
-    mode_parts = ["prompt", "extract", "save"]
-    if run:
-        mode_parts.append("upload to Pi" if resolved_target == "raspi" else "run locally")
-        if resolved_target == "raspi":
-            mode_parts.append("detach on Pi" if long_running else "run on Pi")
-    if verify:
-        mode_parts.append("verify loop")
-    if has_tests:
-        mode_parts.append("acceptance tests")
-    log.log("=" * 60)
-    log.log(f"PIPELINE: {' -> '.join(mode_parts)}")
-    log.log(f"TARGET:   {target_display(resolved_target)}")
-    if long_running:
-        log.log(f"MODE:     DETACHED (long-running task detected)")
-        log.log(f"          Process will be launched with nohup, sampled after {LONG_RUNNING_SAMPLE_DELAY}s")
+    if use_terminal:
+        mode_parts = ["terminal loop: prompt ChatGPT", "execute on Pi", "observe", "repeat"]
+        log.log("=" * 60)
+        log.log(f"PIPELINE: {' -> '.join(mode_parts)}")
+        log.log(f"TARGET:   {target_display(resolved_target)}")
+        log.log(f"MODE:     TERMINAL LOOP (interactive command execution)")
+        log.log(f"          ChatGPT controls Pi terminal, one command at a time")
+    else:
+        mode_parts = ["prompt", "extract", "save"]
+        if run:
+            mode_parts.append("upload to Pi" if resolved_target == "raspi" else "run locally")
+            if resolved_target == "raspi":
+                mode_parts.append("detach on Pi" if long_running else "run on Pi")
+        if verify:
+            mode_parts.append("verify loop")
+        if has_tests:
+            mode_parts.append("acceptance tests")
+        log.log("=" * 60)
+        log.log(f"PIPELINE: {' -> '.join(mode_parts)}")
+        log.log(f"TARGET:   {target_display(resolved_target)}")
+        if long_running:
+            log.log(f"MODE:     DETACHED (long-running task detected)")
+            log.log(f"          Process will be launched with nohup, sampled after {LONG_RUNNING_SAMPLE_DELAY}s")
     if has_tests:
         log.log(f"TESTS:    {len(acceptance_tests)} acceptance test(s) generated")
         for t in acceptance_tests:
@@ -708,11 +724,74 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
         "verify": verify, "max_retries": max_retries,
         "platform": "windows" if os.name == "nt" else "linux",
         "long_running": long_running,
+        "use_terminal": use_terminal,
         "acceptance_tests": [t.name for t in acceptance_tests],
         "attempts": [],
     }
 
     with ChatGPTSession(headed=headed) as session:
+
+        # ===================================================================
+        # [v0.8] TERMINAL LOOP PATH -- interactive command execution
+        # ===================================================================
+        if use_terminal:
+            terminal_result = run_terminal_loop(
+                session, prompt, log,
+                max_turns=max_retries * 3 + 4,  # generous turns
+                timeout=15,
+            )
+
+            run_log["terminal_loop"] = {
+                "turns": terminal_result["turns"],
+                "commands": [
+                    {"cmd": c[0], "exit_code": c[3]}
+                    for c in terminal_result["commands_executed"]
+                ],
+                "success": terminal_result["success"],
+            }
+
+            # Run acceptance tests if available
+            if has_tests:
+                log.section("Acceptance Tests (Post-Terminal-Loop)")
+                log.log(f"[TESTING] Running {len(acceptance_tests)} acceptance test(s)...")
+                test_results = run_acceptance_tests(
+                    acceptance_tests, pre_snapshots, resolved_target, log
+                )
+                tests_passed = all(r["passed"] for r in test_results)
+                run_log["terminal_loop"]["acceptance_tests"] = [
+                    {"name": r["name"], "passed": r["passed"], "reason": r["reason"]}
+                    for r in test_results
+                ]
+
+                if tests_passed:
+                    log.log(f"[PASS] All {len(test_results)} acceptance test(s) passed!")
+                else:
+                    n_fail = sum(1 for r in test_results if not r["passed"])
+                    log.log(f"[FAIL] {n_fail}/{len(test_results)} test(s) failed")
+                    terminal_result["success"] = tests_passed
+
+            # Finalize terminal loop
+            run_log["finished_at"] = datetime.now().isoformat()
+            run_log["total_attempts"] = terminal_result["turns"]
+            run_log["final_status"] = "success" if terminal_result["success"] else "failed"
+
+            log.section("Run Record")
+            log.log_quiet(f"```json\n{json.dumps(run_log, indent=2, default=str)}\n```")
+            log.write_md(md_path, prompt, resolved_target)
+
+            print(f"\n{'=' * 60}")
+            print(f"Pipeline finished: {run_log['final_status'].upper()}")
+            print(f"  Mode:     Terminal Loop")
+            print(f"  Target:   {resolved_target}")
+            print(f"  Turns:    {terminal_result['turns']}")
+            print(f"  Commands: {len(terminal_result['commands_executed'])}")
+            print(f"  Log:      {md_path}")
+            print(f"{'=' * 60}")
+            return
+
+        # ===================================================================
+        # FILE-BASED PIPELINE PATH -- existing logic
+        # ===================================================================
         attempt = 0
         current_prompt = augmented_prompt
 
