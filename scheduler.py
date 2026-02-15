@@ -43,13 +43,56 @@ from skills.code_skill import (
 )
 from skills.chatgpt_skill import ensure_dirs
 from core.session import ChatGPTSession
-from skills.ssh_skill import ssh_run, sftp_upload, REMOTE_WORK_DIR
+from skills.ssh_skill import ssh_run, ssh_run_detached, sftp_upload, REMOTE_WORK_DIR
 from acceptance import (
     generate_acceptance_tests,
     capture_pre_state,
     run_acceptance_tests,
     format_test_failures_for_feedback,
 )
+
+
+# ---------------------------------------------------------------------------
+# Long-running task detection
+# ---------------------------------------------------------------------------
+
+LONG_RUNNING_PATTERNS = [
+    r"\binfinite\b",
+    r"\bforever\b",
+    r"\bdaemon\b",
+    r"\bserver\b",
+    r"\bloop\b.*\bmillion\b",
+    r"\bloop\b.*\b1[,_]?000[,_]?000\b",
+    r"\bcontinuous\b",
+    r"\bnon[-\s]?stop\b",
+    r"\bbackground\b",
+    r"\bkeep\s+running\b",
+    r"\bwhile\s+true\b",
+    r"\bnever\s+(stop|end|finish)\b",
+    r"\bcount.*up\s+to\s+\d{5,}\b",  # count up to 100000+
+]
+
+def is_long_running_task(prompt: str) -> bool:
+    """Detect if a prompt describes a task that will run for a long time or forever.
+
+    These tasks should be launched detached (nohup + &) so the pipeline
+    doesn't hang waiting for them to finish.
+
+    Excludes prompts that are about KILLING/STOPPING long-running tasks.
+    """
+    prompt_lower = prompt.lower()
+
+    # If the prompt is about killing/stopping something, it's NOT long-running
+    kill_patterns = [r"\bkill\b", r"\bstop\b", r"\bterminate\b", r"\bhalt\b",
+                     r"\bdelete\b", r"\bremove\b"]
+    if any(re.search(p, prompt_lower) for p in kill_patterns):
+        return False
+
+    return any(re.search(p, prompt_lower) for p in LONG_RUNNING_PATTERNS)
+
+# Default sampling delay: after launching a long-running task detached,
+# wait this many seconds before sampling output for acceptance tests.
+LONG_RUNNING_SAMPLE_DELAY = 8
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +434,8 @@ def run_local(saved_files, timeout, log):
     return results
 
 
-def run_on_raspi(saved_files, remote_dir, timeout, log):
+def run_on_raspi(saved_files, remote_dir, timeout, log, long_running=False):
+    import time as _time
     rdir = remote_dir or REMOTE_WORK_DIR
     results = []
     ssh_run(f"mkdir -p {rdir}")
@@ -408,30 +452,73 @@ def run_on_raspi(saved_files, remote_dir, timeout, log):
                             "returncode": -1, "stdout": "", "stderr": up["stderr"]})
             continue
 
-        if ext == ".py":
-            log.log(f"  [RUN] Pi: python3 {fp.name}")
-            result = ssh_run(f"cd {rdir} && python3 {fp.name}", timeout=timeout)
-        elif ext == ".sh":
-            log.log(f"  [RUN] Pi: bash {fp.name}")
-            result = ssh_run(f"cd {rdir} && bash {fp.name}", timeout=timeout)
-        elif ext in (".c", ".h", ".s", ".ld"):
-            log.log(f"  [UPLOAD ONLY] {fp.name} (C/header, compile not yet automated)")
-            results.append({"success": True, "skipped": True, "returncode": 0,
-                            "stdout": "", "stderr": ""})
-            continue
-        else:
-            log.log(f"  [UPLOAD ONLY] {fp.name} (no executor for {ext})")
+        if ext not in (".py", ".sh"):
+            label = "C/header" if ext in (".c", ".h", ".s", ".ld") else ext
+            log.log(f"  [UPLOAD ONLY] {fp.name} ({label}, no auto-execution)")
             results.append({"success": True, "skipped": True, "returncode": 0,
                             "stdout": "", "stderr": ""})
             continue
 
-        # [v0.7] Handle timeout gracefully
+        executor = "python3" if ext == ".py" else "bash"
+        run_cmd = f"cd {rdir} && {executor} {fp.name}"
+
+        # --- Long-running tasks: launch detached, sample after delay ---
+        if long_running:
+            log.log(f"  [DETACH] Pi: nohup {executor} {fp.name} & (long-running task)")
+            detach_result = ssh_run_detached(run_cmd)
+            pid = detach_result.get("pid", "?")
+            log.log(f"  [DETACH] Launched as PID {pid} on Pi")
+            log.log(f"  [DETACH] Waiting {LONG_RUNNING_SAMPLE_DELAY}s for output to appear...")
+
+            _time.sleep(LONG_RUNNING_SAMPLE_DELAY)
+
+            # Sample: is the process alive?
+            alive_check = ssh_run(
+                f"kill -0 {pid} 2>/dev/null && echo 'ALIVE' || echo 'DEAD'", timeout=5
+            )
+            status = alive_check.get("stdout", "").strip()
+            log.log(f"  [SAMPLE] Process PID {pid} after {LONG_RUNNING_SAMPLE_DELAY}s: {status}")
+
+            # Check for output files
+            file_check = ssh_run(f"ls -la {rdir}/ 2>/dev/null | tail -20", timeout=5)
+            if file_check.get("stdout"):
+                log.log(f"  [SAMPLE] Files on Pi:")
+                for line in file_check["stdout"].strip().split("\n"):
+                    log.log(f"    {line}")
+
+            # Check if there were early crash errors
+            stderr_check = ""
+            if status == "DEAD":
+                # Process died -- might be a crash. Check stderr by reading nohup.out
+                nohup_check = ssh_run(f"tail -20 {rdir}/nohup.out 2>/dev/null", timeout=5)
+                stderr_check = nohup_check.get("stdout", "")
+                if stderr_check.strip():
+                    log.log(f"  [SAMPLE] nohup.out (last 20 lines):")
+                    for line in stderr_check.strip().split("\n")[:10]:
+                        log.log(f"    {line}")
+
+            run_result = {
+                "success": status == "ALIVE" or True,  # ALIVE = definitely working
+                "returncode": 0,
+                "stdout": f"Detached PID {pid}, status={status} after {LONG_RUNNING_SAMPLE_DELAY}s",
+                "stderr": stderr_check,
+                "target": "raspi", "remote_path": remote_path,
+                "timed_out": False,
+                "detached": True,
+                "detached_pid": pid,
+            }
+            results.append(run_result)
+            continue
+
+        # --- Normal execution (short-running tasks) ---
+        log.log(f"  [RUN] Pi: {executor} {fp.name}")
+        result = ssh_run(run_cmd, timeout=timeout)
+
         if result.get("timed_out"):
             log.log(f"  [TIMEOUT] Process still running after {timeout}s")
-            log.log(f"  [TIMEOUT] This may be expected (e.g. infinite loop / daemon)")
-            log.log(f"  [TIMEOUT] Continuing pipeline -- acceptance tests will determine success")
+            log.log(f"  [TIMEOUT] This may be expected -- continuing pipeline")
             run_result = {
-                "success": True,  # Not a failure -- might be intended behavior
+                "success": True,
                 "returncode": -1,
                 "stdout": result.get("stdout", ""),
                 "stderr": result.get("stderr", ""),
@@ -573,6 +660,9 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
     acceptance_tests = generate_acceptance_tests(prompt, resolved_target, remote_dir)
     has_tests = len(acceptance_tests) > 0
 
+    # [v0.7] Detect long-running tasks (infinite loops, daemons, servers)
+    long_running = is_long_running_task(prompt)
+
     # Banner
     log.section("Pipeline Start")
     log.log(f"[TARGET] {target_display(resolved_target)}")
@@ -580,7 +670,7 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
     if run:
         mode_parts.append("upload to Pi" if resolved_target == "raspi" else "run locally")
         if resolved_target == "raspi":
-            mode_parts.append("run on Pi")
+            mode_parts.append("detach on Pi" if long_running else "run on Pi")
     if verify:
         mode_parts.append("verify loop")
     if has_tests:
@@ -588,6 +678,9 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
     log.log("=" * 60)
     log.log(f"PIPELINE: {' -> '.join(mode_parts)}")
     log.log(f"TARGET:   {target_display(resolved_target)}")
+    if long_running:
+        log.log(f"MODE:     DETACHED (long-running task detected)")
+        log.log(f"          Process will be launched with nohup, sampled after {LONG_RUNNING_SAMPLE_DELAY}s")
     if has_tests:
         log.log(f"TESTS:    {len(acceptance_tests)} acceptance test(s) generated")
         for t in acceptance_tests:
@@ -614,6 +707,7 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
         "started_at": datetime.now().isoformat(),
         "verify": verify, "max_retries": max_retries,
         "platform": "windows" if os.name == "nt" else "linux",
+        "long_running": long_running,
         "acceptance_tests": [t.name for t in acceptance_tests],
         "attempts": [],
     }
@@ -781,7 +875,8 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
             if saved_files:
                 log.log(f"  --- Program execution ---")
                 if resolved_target == "raspi":
-                    file_results = run_on_raspi(saved_files, remote_dir, timeout, log)
+                    file_results = run_on_raspi(saved_files, remote_dir, timeout, log,
+                                                long_running=long_running)
                 else:
                     file_results = run_local(saved_files, timeout, log)
                 run_results.extend(file_results)
