@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-scheduler.py -- Unified pipeline: prompt -> ChatGPT -> extract -> classify -> execute
+scheduler.py -- Unified pipeline: prompt -> ChatGPT -> extract -> classify -> execute -> TEST
 
 Single entry point that ties everything together:
 
-  1. Sends prompt to ChatGPT (via core/session.py)
-  2. Saves response to raw_md/ (via skills/chatgpt_skill.py)
-  3. Extracts code blocks (via skills/code_skill.py)
-  4. Filters out junk blocks (example output, one-liner run commands)
-  5. Classifies target: local or Raspberry Pi
-  6. Routes execution accordingly
-  7. Captures output, logs everything
-  8. If --verify: sends errors back to ChatGPT for a fix
+  1. Generates acceptance tests from the prompt (BEFORE asking ChatGPT)
+  2. Captures pre-state snapshot (process list, file list, etc.)
+  3. Sends prompt to ChatGPT (via core/session.py)
+  4. Saves response to raw_md/ (via skills/chatgpt_skill.py)
+  5. Extracts code blocks (via skills/code_skill.py)
+  6. Filters out junk blocks (example output, one-liner run commands)
+  7. Checks for intent contradictions (code that does opposite of prompt)
+  8. Classifies target: local or Raspberry Pi
+  9. Routes execution accordingly
+  10. Runs acceptance tests (compares pre/post state)
+  11. If tests fail: sends SPECIFIC failure details back to ChatGPT for a fix
 
 Usage:
     python scheduler.py "make a random word generator that outputs to a text file in raspi"
@@ -41,6 +44,12 @@ from skills.code_skill import (
 from skills.chatgpt_skill import ensure_dirs
 from core.session import ChatGPTSession
 from skills.ssh_skill import ssh_run, sftp_upload, REMOTE_WORK_DIR
+from acceptance import (
+    generate_acceptance_tests,
+    capture_pre_state,
+    run_acceptance_tests,
+    format_test_failures_for_feedback,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -95,49 +104,165 @@ class PipelineLogger:
 
 
 # ---------------------------------------------------------------------------
-# Block filtering -- separate real programs from junk
+# Block filtering -- classify into programs, direct commands, and junk
 # ---------------------------------------------------------------------------
 
-def is_junk_block(block, all_blocks: list) -> bool:
-    """Determine if a code block is junk (example output, run command, etc.)."""
+def classify_block(block, all_blocks: list, prompt: str = "") -> str:
+    """Classify a code block as 'program', 'direct_cmd', or 'junk'.
+
+    - program: A real program to save as a file and execute (Python, C, etc.)
+    - direct_cmd: A bash one-liner/command to execute directly via SSH
+    - junk: Example output, run instructions, illustration text
+    """
     code = block.code.strip()
     lang = block.language.lower()
     lines = [l for l in code.split("\n") if l.strip()]
     num_lines = len(lines)
 
+    # Text/yaml blocks are always junk
     if lang in ("txt", "text", "plaintext", "yaml", "yml"):
-        return True
+        return "junk"
 
-    if lang in ("bash", "sh") and num_lines <= 3:
+    # Multi-line Python/C/etc with logic = always a program
+    if lang in ("python", "py", "c", "cpp", "c++", "rust", "java", "javascript", "js"):
+        if num_lines >= 3:
+            return "program"
+        # Short python snippet with logic keywords = program
+        has_logic = any(kw in code for kw in [
+            "def ", "class ", "import ", "from ", "for ", "while ",
+            "if ", "#include", "int main",
+        ])
+        if has_logic:
+            return "program"
+        # Very short python (e.g. `import subprocess; subprocess.run(...)`) = program
+        if lang in ("python", "py") and ("import " in code or "os." in code):
+            return "program"
+
+    # Bash blocks: the interesting case
+    if lang in ("bash", "sh", ""):
         joined = " ".join(lines)
-        run_patterns = [
-            r"^python3?\s+\S+\.py", r"^node\s+\S+\.js", r"^gcc\s+",
-            r"^make\b", r"^cd\s+.*&&\s*(python|node|gcc|make|bash|./)",
-            r"^pip\s+install", r"^chmod\s+", r"^sudo\s+", r"^\./\w+",
-        ]
-        for pat in run_patterns:
-            if re.match(pat, joined, re.IGNORECASE):
-                return True
 
-    if num_lines <= 2 and lang not in ("c", "cpp", "c++"):
+        # Junk: process-launching tips (python3 X.py &, nohup, fg/Ctrl+C)
+        if num_lines <= 5:
+            if re.search(r"python3?\s+\S+\.py\s*&", joined):
+                return "junk"
+            if re.search(r"nohup\s+python", joined):
+                return "junk"
+            if re.search(r"\bfg\b", joined) and re.search(r"ctrl", joined, re.IGNORECASE):
+                return "junk"
+            if re.search(r"kill\s+\$\(cat\s+", joined):
+                return "junk"
+
+        # Junk: example output patterns
+        if num_lines <= 2 and re.search(r"\b\d+\s+\d+\.\d+\s+", code):
+            return "junk"  # Looks like ps aux output
+
+        # Junk: placeholder PIDs (kill 12345, kill -9 <PID>)
+        if num_lines <= 2 and re.search(r"kill\s+(-\d+\s+)?(\d{4,5}|<PID>)", code):
+            return "junk"
+
+        # Junk: verification commands (ps aux | grep ...)
+        if num_lines == 1 and re.search(r"^ps\s+aux\s*\|", code):
+            return "junk"
+
+        # Junk: pip install, chmod, sudo reboot
+        if num_lines <= 2:
+            if re.search(r"^(pip\s+install|chmod\s+|sudo\s+reboot)", joined, re.IGNORECASE):
+                return "junk"
+
+        # Direct command: actionable bash commands (pkill, kill with real pattern, etc.)
+        # These are commands that DO something useful and should be run directly via SSH
+        direct_patterns = [
+            r"^pkill\s+(-\w+\s+)*-f\s+\S+",   # pkill -f script_name
+            r"^pkill\s+(-\d+\s+)?\w+",          # pkill python3
+            r"^killall\s+",                       # killall
+            r"^systemctl\s+(stop|restart|start)",  # systemctl commands
+            r"^service\s+\w+\s+(stop|restart)",    # service commands
+        ]
+        for pat in direct_patterns:
+            if re.match(pat, joined, re.IGNORECASE):
+                return "direct_cmd"
+
+        # Multi-line bash with logic = a real shell script (program)
+        if num_lines >= 5:
+            return "program"
+        if any(kw in code for kw in ["for ", "while ", "if ", "function ", "#!/"]):
+            return "program"
+
+        # Short bash with no clear purpose = junk
+        if num_lines <= 2:
+            return "junk"
+
+    # Anything else short with no logic = junk
+    if num_lines <= 2:
         has_logic = any(kw in code for kw in [
             "def ", "class ", "import ", "from ", "for ", "while ",
             "if ", "#include", "int main", "void ", "fn ",
         ])
         if not has_logic:
-            return True
+            return "junk"
 
-    return False
+    return "program"
 
 
-def filter_blocks(blocks: list) -> tuple:
-    real, junk = [], []
+def filter_blocks(blocks: list, prompt: str = "") -> tuple:
+    """Classify all blocks into (real_programs, direct_commands, junk)."""
+    programs, direct_cmds, junk = [], [], []
     for b in blocks:
-        (junk if is_junk_block(b, blocks) else real).append(b)
-    if not real and blocks:
+        classification = classify_block(b, blocks, prompt)
+        if classification == "program":
+            programs.append(b)
+        elif classification == "direct_cmd":
+            direct_cmds.append(b)
+        else:
+            junk.append(b)
+
+    # Safety net: if no programs AND no direct commands, keep largest block
+    if not programs and not direct_cmds and blocks:
         largest = max(blocks, key=lambda b: len(b.code))
-        real, junk = [largest], [b for b in blocks if b is not largest]
-    return real, junk
+        programs = [largest]
+        junk = [b for b in blocks if b is not largest]
+
+    return programs, direct_cmds, junk
+
+
+# ---------------------------------------------------------------------------
+# Intent-contradiction detection
+# ---------------------------------------------------------------------------
+
+DESTRUCTIVE_INTENT_PATTERNS = [
+    r"\bkill\b", r"\bstop\b", r"\bterminate\b", r"\bend\b",
+    r"\bdelete\b", r"\bremove\b", r"\bclean\s*up\b", r"\bcancel\b",
+    r"\bhalt\b", r"\babort\b", r"\bshut\s*down\b",
+]
+
+CONSTRUCTIVE_CODE_PATTERNS = [
+    (r"python3?\s+\S+\.py\s*&", "launches a python process in background"),
+    (r"nohup\s+", "launches a process with nohup"),
+    (r"systemctl\s+start\b", "starts a systemd service"),
+    (r"systemctl\s+enable\b", "enables a systemd service"),
+    (r"echo\s+\$!\s*>\s*\S+\.pid", "writes a PID file (launch pattern)"),
+]
+
+
+def detect_intent_contradiction(prompt: str, block) -> str:
+    prompt_lower = prompt.lower()
+    has_destructive_intent = any(
+        re.search(p, prompt_lower) for p in DESTRUCTIVE_INTENT_PATTERNS
+    )
+    if not has_destructive_intent:
+        return ""
+    code = block.code.strip()
+    warnings = []
+    for pattern, description in CONSTRUCTIVE_CODE_PATTERNS:
+        if re.search(pattern, code):
+            warnings.append(description)
+    if warnings:
+        return (
+            f"BLOCKED: Code {', '.join(warnings)} but prompt intent is destructive "
+            f"(kill/stop/remove). This would do the OPPOSITE of what was requested."
+        )
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -286,38 +411,54 @@ def run_on_raspi(saved_files, remote_dir, timeout, log):
         if ext == ".py":
             log.log(f"  [RUN] Pi: python3 {fp.name}")
             result = ssh_run(f"cd {rdir} && python3 {fp.name}", timeout=timeout)
+        elif ext == ".sh":
+            log.log(f"  [RUN] Pi: bash {fp.name}")
+            result = ssh_run(f"cd {rdir} && bash {fp.name}", timeout=timeout)
+        elif ext in (".c", ".h", ".s", ".ld"):
+            log.log(f"  [UPLOAD ONLY] {fp.name} (C/header, compile not yet automated)")
+            results.append({"success": True, "skipped": True, "returncode": 0,
+                            "stdout": "", "stderr": ""})
+            continue
+        else:
+            log.log(f"  [UPLOAD ONLY] {fp.name} (no executor for {ext})")
+            results.append({"success": True, "skipped": True, "returncode": 0,
+                            "stdout": "", "stderr": ""})
+            continue
+
+        # [v0.7] Handle timeout gracefully
+        if result.get("timed_out"):
+            log.log(f"  [TIMEOUT] Process still running after {timeout}s")
+            log.log(f"  [TIMEOUT] This may be expected (e.g. infinite loop / daemon)")
+            log.log(f"  [TIMEOUT] Continuing pipeline -- acceptance tests will determine success")
+            run_result = {
+                "success": True,  # Not a failure -- might be intended behavior
+                "returncode": -1,
+                "stdout": result.get("stdout", ""),
+                "stderr": result.get("stderr", ""),
+                "target": "raspi", "remote_path": remote_path,
+                "timed_out": True,
+            }
+        else:
             run_result = {
                 "success": result["success"], "returncode": result["exit_code"],
                 "stdout": result["stdout"], "stderr": result["stderr"],
                 "target": "raspi", "remote_path": remote_path,
+                "timed_out": False,
             }
             if result["success"]:
                 log.log(f"  [OK] Execution succeeded on Pi")
             else:
                 log.log(f"  [FAIL] Exit code: {result['exit_code']}")
-            if result["stdout"]:
-                log.log(f"  [Pi STDOUT]")
-                for line in result["stdout"].strip().split("\n")[:20]:
-                    log.log(f"    {line}")
-            if result["stderr"]:
-                log.log(f"  [Pi STDERR]")
-                for line in result["stderr"].strip().split("\n")[:10]:
-                    log.log(f"    {line}")
-            results.append(run_result)
-        elif ext == ".sh":
-            log.log(f"  [RUN] Pi: bash {fp.name}")
-            result = ssh_run(f"cd {rdir} && bash {fp.name}", timeout=timeout)
-            results.append({"success": result["success"], "returncode": result["exit_code"],
-                            "stdout": result["stdout"], "stderr": result["stderr"],
-                            "target": "raspi", "remote_path": remote_path})
-        elif ext in (".c", ".h", ".s", ".ld"):
-            log.log(f"  [UPLOAD ONLY] {fp.name} (C/header, compile not yet automated)")
-            results.append({"success": True, "skipped": True, "returncode": 0,
-                            "stdout": "", "stderr": ""})
-        else:
-            log.log(f"  [UPLOAD ONLY] {fp.name} (no executor for {ext})")
-            results.append({"success": True, "skipped": True, "returncode": 0,
-                            "stdout": "", "stderr": ""})
+
+        if result.get("stdout"):
+            log.log(f"  [Pi STDOUT]")
+            for line in result["stdout"].strip().split("\n")[:20]:
+                log.log(f"    {line}")
+        if result.get("stderr"):
+            log.log(f"  [Pi STDERR]")
+            for line in result["stderr"].strip().split("\n")[:10]:
+                log.log(f"    {line}")
+        results.append(run_result)
 
     log.log(f"  [CHECK] Files on Pi ({rdir}):")
     verify = ssh_run(f"ls -la {rdir}/ 2>/dev/null | tail -20")
@@ -327,17 +468,60 @@ def run_on_raspi(saved_files, remote_dir, timeout, log):
     return results
 
 
+def run_direct_commands(commands, log):
+    """Execute bash one-liners directly on Pi via SSH (no file upload needed).
+
+    Used for actionable commands like pkill, systemctl stop, etc.
+    Returns a list of result dicts.
+    """
+    results = []
+    for cmd_block in commands:
+        cmd = cmd_block.code.strip()
+        log.log(f"  [SSH-DIRECT] {cmd}")
+        result = ssh_run(cmd, timeout=15)
+        run_result = {
+            "success": result["success"],
+            "returncode": result["exit_code"],
+            "stdout": result.get("stdout", ""),
+            "stderr": result.get("stderr", ""),
+            "target": "raspi",
+            "direct_cmd": True,
+            "timed_out": result.get("timed_out", False),
+        }
+        if result["success"]:
+            log.log(f"  [SSH-DIRECT OK] exit code 0")
+        else:
+            log.log(f"  [SSH-DIRECT] exit code {result['exit_code']}")
+        if result.get("stdout"):
+            for line in result["stdout"].strip().split("\n")[:5]:
+                log.log(f"    {line}")
+        results.append(run_result)
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Feedback builder (target-aware)
 # ---------------------------------------------------------------------------
 
-def build_feedback(target, code_files, run_results):
+def build_feedback(target, code_files, run_results, test_failure_msg=None):
+    """Build a feedback prompt for ChatGPT."""
+    if test_failure_msg:
+        lines = [test_failure_msg, ""]
+        lines.extend([
+            "IMPORTANT: This code runs on Raspberry Pi 5 (Linux aarch64, Python 3).",
+            "Do NOT use emojis or Unicode symbols. ASCII only.",
+            "Do NOT use third-party libraries unless absolutely necessary.",
+            "Do NOT delete files or take unrelated actions.",
+            "Respond with ONLY the complete Python script. No shell commands, no tips.",
+            "Please fix the code. Return the complete corrected version.",
+        ])
+        return "\n".join(lines)
+
     if target in ("local", "auto"):
         return build_feedback_prompt(code_files, run_results)
 
     lines = ["The code you just gave me has errors when run on the Raspberry Pi via SSH.",
              "Here are the execution results:", ""]
-
     for code_file, result in zip(code_files, run_results):
         if result is None or result.get("skipped"):
             continue
@@ -354,11 +538,11 @@ def build_feedback(target, code_files, run_results):
         if result.get("error"):
             lines.append(f"Error: {result['error']}")
         lines.append("")
-
     lines.extend([
         "IMPORTANT: This code runs on Raspberry Pi 5 (Linux aarch64, Python 3).",
         "Do NOT use emojis or Unicode symbols. ASCII only.",
         "Do NOT use third-party libraries unless absolutely necessary.",
+        "Respond with ONLY the complete Python script. No shell commands, no tips.",
         "Please fix the code. Return the complete corrected version.",
     ])
     return "\n".join(lines)
@@ -385,6 +569,10 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
         if resolved_target == "auto":
             resolved_target = "local"
 
+    # [v0.6] Generate acceptance tests BEFORE asking ChatGPT
+    acceptance_tests = generate_acceptance_tests(prompt, resolved_target, remote_dir)
+    has_tests = len(acceptance_tests) > 0
+
     # Banner
     log.section("Pipeline Start")
     log.log(f"[TARGET] {target_display(resolved_target)}")
@@ -395,10 +583,23 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
             mode_parts.append("run on Pi")
     if verify:
         mode_parts.append("verify loop")
+    if has_tests:
+        mode_parts.append("acceptance tests")
     log.log("=" * 60)
     log.log(f"PIPELINE: {' -> '.join(mode_parts)}")
     log.log(f"TARGET:   {target_display(resolved_target)}")
+    if has_tests:
+        log.log(f"TESTS:    {len(acceptance_tests)} acceptance test(s) generated")
+        for t in acceptance_tests:
+            log.log(f"  - {t.name}")
     log.log("=" * 60)
+
+    # [v0.6] Capture pre-state BEFORE anything runs
+    pre_snapshots = {}
+    if has_tests and run and resolved_target == "raspi":
+        log.section("Pre-State Snapshot")
+        log.log("[PRE] Capturing system state before code execution...")
+        pre_snapshots = capture_pre_state(acceptance_tests, resolved_target, log)
 
     prompt_prefix = build_prompt_prefix(resolved_target)
     augmented_prompt = prompt_prefix + prompt
@@ -413,6 +614,7 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
         "started_at": datetime.now().isoformat(),
         "verify": verify, "max_retries": max_retries,
         "platform": "windows" if os.name == "nt" else "linux",
+        "acceptance_tests": [t.name for t in acceptance_tests],
         "attempts": [],
     }
 
@@ -461,13 +663,69 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
             for b in all_blocks:
                 log.log(f"    [{b.index}] {b.language} -- {len(b.code)} chars")
 
-            real_blocks, junk_blocks = filter_blocks(all_blocks)
+            real_blocks, direct_cmds, junk_blocks = filter_blocks(all_blocks, prompt)
             if junk_blocks:
                 log.log(f"  Filtered out {len(junk_blocks)} junk block(s):")
                 for b in junk_blocks:
                     preview = b.code[:60].replace("\n", " ")
                     log.log(f"    [{b.index}] {b.language} -- \"{preview}...\"")
-            log.log(f"  Keeping {len(real_blocks)} real program block(s)")
+            if direct_cmds:
+                log.log(f"  Found {len(direct_cmds)} direct SSH command(s):")
+                for b in direct_cmds:
+                    log.log(f"    [{b.index}] {b.language} -- \"{b.code.strip()[:60]}\"")
+            log.log(f"  Keeping {len(real_blocks)} program block(s), {len(direct_cmds)} direct command(s)")
+
+            # Intent-contradiction check (on programs only)
+            contradiction_found = False
+            safe_blocks = []
+            for b in real_blocks:
+                warning = detect_intent_contradiction(prompt, b)
+                if warning:
+                    log.log(f"  [CONTRADICTION] Block [{b.index}]: {warning}")
+                    junk_blocks.append(b)
+                    contradiction_found = True
+                else:
+                    safe_blocks.append(b)
+            real_blocks = safe_blocks
+
+            # Also check direct commands for contradictions
+            safe_cmds = []
+            for b in direct_cmds:
+                warning = detect_intent_contradiction(prompt, b)
+                if warning:
+                    log.log(f"  [CONTRADICTION] Command [{b.index}]: {warning}")
+                    junk_blocks.append(b)
+                    contradiction_found = True
+                else:
+                    safe_cmds.append(b)
+            direct_cmds = safe_cmds
+
+            if contradiction_found and not real_blocks and not direct_cmds:
+                log.log(f"  [WARN] ALL remaining blocks contradicted user intent!")
+                current_prompt = (
+                    "Your response did not include a working script to accomplish the task. "
+                    "Instead, it included shell tips and examples that would do the OPPOSITE "
+                    "(e.g., launching the process instead of killing it).\n\n"
+                    "I need a COMPLETE, SELF-CONTAINED Python 3 script that I can deploy "
+                    "and run on the Raspberry Pi to accomplish this task:\n\n"
+                    f"{prompt}\n\n"
+                    "Requirements:\n"
+                    "- Pure Python 3, stdlib only\n"
+                    "- Must actually perform the action, not just print instructions\n"
+                    "- ASCII only, no emojis\n"
+                    "- Save any logs in the same directory as the script\n"
+                    "- Use platform.node() to prove it ran on the Pi"
+                )
+                attempt_log["status"] = "contradiction_detected"
+                attempt_log["files"] = []
+                run_log["attempts"].append(attempt_log)
+                continue
+
+            if not real_blocks and not direct_cmds:
+                log.log("[WARN] No usable code blocks after filtering.")
+                attempt_log["status"] = "no_usable_blocks"
+                run_log["attempts"].append(attempt_log)
+                break
 
             if target is None:
                 code_target = classify_target(prompt, code_blocks=real_blocks)
@@ -475,23 +733,25 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
                     log.log(f"  [RECLASSIFY] Code content suggests Raspberry Pi")
                     resolved_target = "raspi"
 
-            # Step 3: Save
-            log.section(f"Step 3: Save to programs/ (Attempt {attempt})")
-            log.log(f"[3/4] Saving to {dest_dir}/")
-            if is_retry:
-                for old in dest_dir.glob("*"):
-                    if old.is_file() and old.suffix in (".py", ".c", ".cpp", ".h", ".sh", ".js", ".txt"):
-                        old.unlink()
-
-            hints = extract_all_filename_hints(response)
-            single_hint = extract_filename_hint(response)
+            # Step 3: Save programs (if any)
             saved_files = []
-            for i, b in enumerate(real_blocks):
-                fname = assign_filename(b, prompt, hints, single_hint, i, len(real_blocks))
-                fp = save_code_block(b, dest_dir, filename=fname)
-                saved_files.append(fp)
-                log.log(f"  [SAVED] {fp.name}  ({b.language}, {len(b.code)} chars)")
+            if real_blocks:
+                log.section(f"Step 3: Save to programs/ (Attempt {attempt})")
+                log.log(f"[3/4] Saving to {dest_dir}/")
+                if is_retry:
+                    for old in dest_dir.glob("*"):
+                        if old.is_file() and old.suffix in (".py", ".c", ".cpp", ".h", ".sh", ".js", ".txt"):
+                            old.unlink()
+
+                hints = extract_all_filename_hints(response)
+                single_hint = extract_filename_hint(response)
+                for i, b in enumerate(real_blocks):
+                    fname = assign_filename(b, prompt, hints, single_hint, i, len(real_blocks))
+                    fp = save_code_block(b, dest_dir, filename=fname)
+                    saved_files.append(fp)
+                    log.log(f"  [SAVED] {fp.name}  ({b.language}, {len(b.code)} chars)")
             attempt_log["files"] = [fp.name for fp in saved_files]
+            attempt_log["direct_cmds"] = [b.code.strip()[:80] for b in direct_cmds]
 
             # Step 4: Execute
             if not run:
@@ -503,29 +763,79 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
             log.section(f"Step 4: Execute (Attempt {attempt})")
             log.log(f"[4/4] Executing on {target_display(resolved_target)}...")
 
-            if resolved_target == "raspi":
-                run_results = run_on_raspi(saved_files, remote_dir, timeout, log)
-            else:
-                run_results = run_local(saved_files, timeout, log)
-
-            all_passed = True
+            run_results = []
             any_ran = False
-            for fp, result in zip(saved_files, run_results):
-                if result.get("skipped"): continue
-                any_ran = True
-                if not result.get("success"): all_passed = False
+            all_passed = True
+
+            # [v0.7] Execute direct SSH commands first (e.g. pkill -f counter)
+            if direct_cmds and resolved_target == "raspi":
+                log.log(f"  --- Direct SSH commands ---")
+                cmd_results = run_direct_commands(direct_cmds, log)
+                run_results.extend(cmd_results)
+                for r in cmd_results:
+                    any_ran = True
+                    # For kill commands, non-zero exit is OK (means "no matching process")
+                    # so we don't count it as failure
+
+            # Execute uploaded programs
+            if saved_files:
+                log.log(f"  --- Program execution ---")
+                if resolved_target == "raspi":
+                    file_results = run_on_raspi(saved_files, remote_dir, timeout, log)
+                else:
+                    file_results = run_local(saved_files, timeout, log)
+                run_results.extend(file_results)
+                for result in file_results:
+                    if result.get("skipped"): continue
+                    any_ran = True
+                    if not result.get("success") and not result.get("timed_out"):
+                        all_passed = False
+
             if not any_ran:
                 log.log(f"\n[WARN] No files were actually executed")
                 all_passed = False
 
-            if all_passed and any_ran:
+            # [v0.6] Run acceptance tests
+            test_results = []
+            tests_passed = True
+            test_failure_msg = ""
+
+            if all_passed and any_ran and has_tests and resolved_target == "raspi":
+                log.section(f"Step 5: Acceptance Tests (Attempt {attempt})")
+                log.log(f"[TESTING] Running {len(acceptance_tests)} acceptance test(s)...")
+
+                test_results = run_acceptance_tests(
+                    acceptance_tests, pre_snapshots, resolved_target, log
+                )
+
+                tests_passed = all(r["passed"] for r in test_results)
+                attempt_log["acceptance_tests"] = [
+                    {"name": r["name"], "passed": r["passed"], "reason": r["reason"]}
+                    for r in test_results
+                ]
+
+                if not tests_passed:
+                    test_failure_msg = format_test_failures_for_feedback(test_results)
+                    n_fail = sum(1 for r in test_results if not r["passed"])
+                    log.log(f"[FAIL] {n_fail}/{len(test_results)} acceptance test(s) failed")
+                else:
+                    log.log(f"[PASS] All {len(test_results)} acceptance test(s) passed!")
+
+            if all_passed and any_ran and tests_passed:
                 log.section("Result")
                 log.log(f"[DONE] All code ran successfully on {resolved_target}!")
+                if has_tests:
+                    log.log(f"[DONE] All {len(acceptance_tests)} acceptance test(s) passed!")
                 attempt_log["status"] = "success"
                 run_log["attempts"].append(attempt_log)
                 break
 
-            attempt_log["status"] = "failed"
+            # Failure
+            if all_passed and any_ran and not tests_passed:
+                attempt_log["status"] = "tests_failed"
+            else:
+                attempt_log["status"] = "failed"
+
             if not verify or attempt > max_retries:
                 run_log["attempts"].append(attempt_log)
                 log.section("Result")
@@ -537,7 +847,15 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
 
             log.section(f"Feedback (Attempt {attempt})")
             log.log(f"[FEEDBACK] Building error report for ChatGPT...")
-            current_prompt = build_feedback(resolved_target, saved_files, run_results)
+
+            if test_failure_msg:
+                current_prompt = build_feedback(
+                    resolved_target, saved_files, run_results,
+                    test_failure_msg=test_failure_msg,
+                )
+            else:
+                current_prompt = build_feedback(resolved_target, saved_files, run_results)
+
             log.log(f"  Feedback: {len(current_prompt)} chars")
             log.log_quiet(f"```\n{current_prompt}\n```")
             attempt_log["feedback_chars"] = len(current_prompt)
@@ -568,7 +886,7 @@ def run_pipeline(prompt, target=None, dest=None, run=True, headed=True,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="VerifyBot: prompt -> ChatGPT -> extract -> classify -> execute",
+        description="VerifyBot: prompt -> ChatGPT -> extract -> classify -> execute -> TEST",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

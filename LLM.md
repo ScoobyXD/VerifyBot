@@ -34,6 +34,7 @@ Replace "raspi" with "local" and step 7 becomes local execution instead.
 ```
 verifybot/
 |-- scheduler.py               # Entry point -- run everything from here
+|-- acceptance.py              # Acceptance test generation + pre/post state diffing
 |-- core/                      # Infrastructure (things skills depend on)
 |   |-- __init__.py            # Required for Python package imports
 |   |-- selectors.py           # ChatGPT DOM selectors
@@ -81,7 +82,8 @@ On the Raspberry Pi:
 
 | File | Purpose |
 |---|---|
-| `scheduler.py` | Entry point. prompt -> ChatGPT -> extract -> filter -> classify -> execute. Browser visible and auto-retry on by default. |
+| `scheduler.py` | Entry point. prompt -> ChatGPT -> extract -> filter -> classify -> execute -> TEST. Browser visible and auto-retry on by default. |
+| `acceptance.py` | Acceptance test generation and evaluation. Pre/post state diffing for kill-process, create-file, etc. No external deps. |
 | `.env` | Pi SSH credentials (PI_USER, PI_HOST, PI_PASSWORD). Gitignored, never committed. |
 | `.gitignore` | Keeps secrets, caches, and generated files out of git |
 | `LLM.md` | This file |
@@ -99,7 +101,11 @@ scheduler.py
   |-- core.session          (ChatGPTSession)
   |-- skills.code_skill     (extract, save, run, feedback)
   |-- skills.chatgpt_skill  (ensure_dirs)
-  +-- skills.ssh_skill      (ssh_run, sftp_upload)
+  |-- skills.ssh_skill      (ssh_run, sftp_upload)
+  +-- acceptance            (generate_acceptance_tests, capture_pre_state, run_acceptance_tests)
+
+acceptance.py
+  +-- skills.ssh_skill      (ssh_run, REMOTE_WORK_DIR -- conditional import)
 
 skills/chatgpt_skill.py
   |-- core.selectors
@@ -221,9 +227,13 @@ sudo apt install gcc-arm-none-eabi openocd can-utils
 5. PipelineLogger -- terminal output mirrored in raw_md transcript
 6. Folder reorganization: core/ for infrastructure, skills/ for all skills
 
-### Phase 1: Testing and iteration
+### Phase 1: Testing and iteration (IN PROGRESS)
 1. Test scheduler end-to-end with various prompts
 2. Tune classify_target() and junk filter as edge cases appear
+3. [DONE] Semantic post-condition verification for destructive prompts (kill, delete)
+4. [DONE] Intent-contradiction detection (blocks that contradict user intent)
+5. Extend classify_prompt_intent() for more intent types (create, configure, etc.)
+6. Add post-condition checks for local target (not just raspi)
 
 ### Phase 2: Target classification for multi-file responses
 3. Handle responses with both Pi and STM32 code blocks
@@ -240,6 +250,83 @@ sudo apt install gcc-arm-none-eabi openocd can-utils
 10. Test: full CAN roundtrip end-to-end
 
 ## Changelog
+
+### 2026-02-14 v0.6 -- Acceptance testing (pre/post state diffing)
+
+**Problem**: v0.5's post-condition check used a broad regex (`ps aux | grep python`)
+that matched a system service (wayvnc-control.py, PID 1172, owned by root). The counter
+was ACTUALLY killed on attempt 2, but the post-condition kept failing because wayvnc
+was there. This caused 3 wasted retries where ChatGPT produced increasingly aggressive
+scripts that eventually started DELETING files trying to satisfy an impossible check.
+
+**Root cause**: The post-condition system had no concept of "what was already running
+before we started." It couldn't distinguish target processes from system services.
+
+**Solution: Pre/post state diffing with acceptance tests.**
+
+New file: `acceptance.py` -- generates task-specific acceptance tests from the prompt
+BEFORE ChatGPT is consulted. Tests define the success contract.
+
+How it works:
+1. BEFORE code runs: snapshot system state (process list, file sizes, etc.)
+2. AFTER code runs: snapshot again
+3. Compare the DIFF: only changes from pre-state matter
+4. System processes in pre-state that DON'T match target patterns are ignored
+
+For "kill process" prompts, two complementary tests are generated:
+- **PID test**: Were the specific PIDs matching "counter"/"infinite" from pre-state
+  removed in post-state? wayvnc doesn't match those keywords -> automatically excluded.
+- **File stability test**: Sample output file size twice with 3s gap. If still growing,
+  process is alive regardless of what the PID check says.
+
+Feedback to ChatGPT now includes specific test failures with evidence:
+- "FAILED TEST: Target processes killed -- 1/1 target PIDs still alive. Surviving: [2080]"
+- Instead of generic "post-condition failed"
+
+Also tells ChatGPT "Do NOT delete files or take unrelated actions" to prevent the
+file-deletion behavior seen in attempt 4.
+
+**What changed in scheduler.py**:
+- Removed: `classify_prompt_intent()`, `run_postcondition_check()` (old regex system)
+- Added: imports from `acceptance.py`
+- New pipeline step: "Pre-State Snapshot" runs before ChatGPT is consulted
+- New pipeline step: "Step 5: Acceptance Tests" replaces old "Step 5: Post-Condition Check"
+- Feedback builder uses `format_test_failures_for_feedback()` for specific error messages
+
+### 2026-02-14 v0.5 -- Semantic verification (three-layer fix)
+
+**Problem**: Pipeline said "success" when it accidentally RESTARTED the process it was
+supposed to kill. ChatGPT responded with shell tips instead of a script. The junk filter
+let a 2-line "pro tip" bash block through (`python3 X.py & / echo $! > pid`), which got
+uploaded and executed on the Pi -- relaunching the very process the user wanted dead.
+Exit code 0 = "success" even though the task completely failed.
+
+**Root cause**: The system only verified "did the code run without crashing?" not
+"did the code accomplish what the user actually wanted?"
+
+**Three layers of fixes**:
+
+1. **Better junk filtering** (`is_junk_block` expanded):
+   - Catches backgrounded process launches (`python3 X.py &`)
+   - Catches nohup patterns, `fg`/`Ctrl+C` examples, `kill $(cat pid)` examples
+   - Now checks bash blocks up to 5 lines (was 3) for these patterns
+
+2. **Intent-contradiction detection** (`detect_intent_contradiction` -- new):
+   - Classifies user prompt intent (destructive: kill/stop/delete vs constructive)
+   - Checks each surviving code block for patterns that contradict the intent
+   - Example: prompt says "kill process" but code launches a process -> BLOCKED
+   - If all blocks contradict, auto-retries with explicit "give me a Python script" feedback
+
+3. **Semantic post-condition verification** (`classify_prompt_intent` + `run_postcondition_check` -- new):
+   - After code runs successfully, checks whether the intended effect actually happened
+   - For "kill process" prompts: runs `pgrep` on Pi to verify process is actually dead
+   - For "delete file" prompts: checks file no longer exists
+   - If post-condition fails: sends targeted feedback to ChatGPT explaining
+     "code ran but didn't accomplish the task"
+   - Adds Step 5 to pipeline: post-condition check (only for non-generic intents)
+
+**Also fixed**: `run_on_raspi()` now logs stdout/stderr for .sh files (was silent before,
+making it impossible to diagnose what bash scripts actually did).
 
 ### 2026-02-13 v0.4 -- Folder reorganization
 - Moved selectors.py and session.py into core/ (infrastructure)
@@ -272,3 +359,6 @@ sudo apt install gcc-arm-none-eabi openocd can-utils
 3. ssh_skill.py uses paramiko (pure Python) instead of sshpass -- works on Windows.
 4. The junk block filter uses heuristics. If a real program gets filtered, the safety net keeps the largest block. May need tuning over time.
 5. __init__.py files are required in core/ and skills/ for Python package imports. They are one-line comment files. Do not delete them.
+6. Exit code 0 does NOT mean the task succeeded. The acceptance test system (acceptance.py) handles verification via pre/post state diffing. Tests are generated BEFORE ChatGPT runs, defining the success contract. Pre-state snapshots capture what's already running so system services are automatically excluded from kill checks.
+7. ChatGPT "pro tips" and instructional examples are dangerous -- they can get extracted, pass filters, and get executed. The intent-contradiction detector is the safety net for this.
+8. Never use broad regexes for post-condition checks. Always diff against pre-state. A system process running before the task started is not a failure.
