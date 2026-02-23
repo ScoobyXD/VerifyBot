@@ -48,6 +48,7 @@ from skills.extract_skill import (
 
 ROOT = Path(__file__).resolve().parent
 PROGRAMS_DIR = ROOT / "programs"
+OUTPUTS_DIR = ROOT / "outputs"
 CONTEXT_DIR = ROOT / "context"
 
 
@@ -150,9 +151,16 @@ def build_initial_prompt(user_prompt: str, context: str, target: str,
     )
 
 
-def build_error_feedback(executed: list[dict]) -> str:
-    """Build feedback from failed execution results. Just raw output, no tricks."""
-    lines = ["The code failed on the target machine. Here are the results:", ""]
+def build_verification_prompt(executed: list[dict], original_task: str) -> str:
+    """Build a prompt that asks the LLM to verify if the output is correct.
+
+    The LLM decides PASS, FAIL, or REVISE — not us.
+    """
+    lines = [
+        f"I ran your code. Here are the results.",
+        f"The original task was: {original_task}",
+        "",
+    ]
 
     for item in executed:
         name = item.get("name", item.get("cmd", "unknown"))
@@ -160,13 +168,20 @@ def build_error_feedback(executed: list[dict]) -> str:
         lines.append(f"Exit code: {item['exit_code']}")
         if item.get("timed_out"):
             lines.append(f"(Timed out after {item.get('timeout', '?')}s)")
-        if item.get("stderr"):
-            lines.append(f"STDERR:\n{item['stderr'][:3000]}")
         if item.get("stdout"):
-            lines.append(f"STDOUT:\n{item['stdout'][:1500]}")
+            lines.append(f"STDOUT:\n{item['stdout'][:3000]}")
+        if item.get("stderr"):
+            lines.append(f"STDERR:\n{item['stderr'][:2000]}")
         lines.append("")
 
-    lines.append("Fix the code. Return the complete corrected version.")
+    lines.append(
+        "Based on the output above, does this correctly complete the task?\n"
+        "Respond with exactly one of:\n"
+        "- PASS: if the task is complete and the output is correct\n"
+        "- FAIL: if there are errors, and then provide the complete fixed code\n"
+        "- REVISE: if it partially works but needs changes, and then provide the complete revised code"
+    )
+
     return "\n".join(lines)
 
 
@@ -427,22 +442,50 @@ def make_slug(prompt: str) -> str:
 
 
 def save_script(block: CodeBlock, prompt: str, response_text: str,
-                index: int, total: int) -> Path:
-    """Save a code block to programs/."""
+                index: int, total: int, attempt: int) -> Path:
+    """Save a code block to programs/ with versioning.
+
+    Files are named like: prime_generator_1.py, prime_generator_2.py
+    where the number is the attempt. Never overwrites.
+    """
     PROGRAMS_DIR.mkdir(exist_ok=True)
 
     # Try to get a filename from the LLM response
-    fname = extract_filename_hint(response_text)
-    if not fname or Path(fname).suffix != block.extension:
-        slug = make_slug(prompt)
-        if total == 1:
-            fname = f"{slug}{block.extension}"
-        else:
-            fname = f"{slug}_{index}{block.extension}"
+    fname_hint = extract_filename_hint(response_text)
+    if fname_hint and Path(fname_hint).suffix == block.extension:
+        base = Path(fname_hint).stem
+    else:
+        base = make_slug(prompt)
 
+    # Add block index if multiple scripts in one response
+    if total > 1:
+        base = f"{base}_{index}"
+
+    # Add attempt number for versioning
+    fname = f"{base}_{attempt}{block.extension}"
     filepath = PROGRAMS_DIR / fname
+
     filepath.write_text(block.code, encoding="utf-8")
     print(f"  [SAVED] {filepath.name} ({len(block.code)} chars)")
+    return filepath
+
+
+def save_output(name: str, stdout: str, stderr: str, attempt: int) -> Path:
+    """Save execution output to outputs/ folder. Never overwrites."""
+    OUTPUTS_DIR.mkdir(exist_ok=True)
+    base = Path(name).stem if "." in name else name[:40]
+    fname = f"{base}_{attempt}.txt"
+    filepath = OUTPUTS_DIR / fname
+
+    content = ""
+    if stdout:
+        content += f"=== STDOUT ===\n{stdout}\n"
+    if stderr:
+        content += f"\n=== STDERR ===\n{stderr}\n"
+    if not content:
+        content = "(no output)\n"
+
+    filepath.write_text(content, encoding="utf-8")
     return filepath
 
 
@@ -503,8 +546,16 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                 response = session.prompt(current_prompt)
             is_followup = True
 
-            # Log what we got back
+            # Log response
             append_to_log(md_path, f"LLM Response (Attempt {attempt})", response)
+
+            # Check if the LLM just said PASS (from a verification followup)
+            response_stripped = response.strip()
+            if response_stripped.upper().startswith("PASS"):
+                print(f"\n[DONE] LLM verified: PASS")
+                append_to_log(md_path, f"Attempt {attempt} Result",
+                              "LLM VERIFIED: PASS")
+                break
 
             # Handle install requests
             handle_installs(response, resolved)
@@ -513,18 +564,17 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             timeout_hint = extract_timeout_hint(response)
             run_timeout = timeout_hint or timeout
             if timeout_hint:
-                print(f"  [TIMEOUT] LLM says this needs {timeout_hint}s (default was {timeout}s)")
+                print(f"  [TIMEOUT] LLM says {timeout_hint}s needed")
 
             # Step 4: Extract code
             print(f"\n[3] Extracting code from response...")
             blocks = extract_blocks(response)
             if not blocks:
-                print("  [WARN] No code blocks found in response.")
+                print("  [WARN] No code blocks found.")
                 append_to_log(md_path, f"Attempt {attempt}", "No code blocks found.")
-                # Ask LLM to give us actual code
                 current_prompt = (
-                    "I need actual code to execute. Please respond with a "
-                    "complete script in a ```python or ```bash code block."
+                    "Your response contained no executable code. "
+                    "Please provide a complete script in a fenced code block."
                 )
                 continue
 
@@ -532,28 +582,24 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             print(f"  Found: {len(scripts)} script(s), {len(commands)} command(s)")
 
             if not scripts and not commands:
-                print("  [WARN] No executable code found after classification.")
+                print("  [WARN] No executable code after classification.")
                 append_to_log(md_path, f"Attempt {attempt}",
-                              "Extracted blocks but none were executable scripts or commands.")
+                              "Extracted blocks but none executable.")
                 current_prompt = (
-                    "Your response contained code but I couldn't identify any "
-                    "executable scripts or commands. Please put your code inside "
-                    "a fenced code block like:\n\n"
-                    "```python\n# your code here\n```\n\n"
-                    "or\n\n```bash\n# your commands here\n```"
+                    "Your response contained code but none were executable "
+                    "scripts or commands. Please provide a complete script."
                 )
                 continue
 
-            # Step 5: Execute everything
+            # Step 5: Execute
             print(f"\n[4] Executing on {resolved}...")
             all_results = []
 
-            # Commands first
+            # Commands
             if commands:
                 if resolved == "raspi":
                     cmd_results = run_commands_on_pi(commands, timeout=15)
                 else:
-                    # Run bash commands locally
                     cmd_results = []
                     for cmd in commands:
                         print(f"  [LOCAL] {cmd}")
@@ -571,17 +617,11 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                         cmd_results.append(r)
                 all_results.extend(cmd_results)
 
-            # Scripts
+            # Scripts — versioned, never overwrite
             if scripts:
-                # Clean programs dir for retries
-                if attempt > 1:
-                    for old in PROGRAMS_DIR.glob("*"):
-                        if old.is_file():
-                            old.unlink()
-
                 saved_files = []
                 for i, block in enumerate(scripts):
-                    fp = save_script(block, prompt, response, i, len(scripts))
+                    fp = save_script(block, prompt, response, i, len(scripts), attempt)
                     saved_files.append(fp)
 
                 for fp in saved_files:
@@ -592,48 +632,37 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                         result = run_script_local(fp, timeout=run_timeout)
                     all_results.append(result)
 
-            # Step 6: Check results
+            # Save outputs — versioned, never overwrite
             executed = [r for r in all_results if not r.get("skipped")]
+            for r in executed:
+                save_output(r.get("name", "output"), r.get("stdout", ""),
+                            r.get("stderr", ""), attempt)
+
             if not executed:
-                print("\n  [WARN] Nothing was actually executed.")
-                current_prompt = "None of the code blocks were executable. Please provide a runnable script."
+                print("\n  [WARN] Nothing executed.")
+                current_prompt = "None of the code was executable. Please provide a runnable script."
                 continue
 
-            all_ok = all(r["success"] for r in executed)
-            if all_ok:
-                print(f"\n[DONE] All code executed successfully!")
-                # Log success with output
-                success_log = "SUCCESS\n\n"
-                for r in executed:
-                    success_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
-                    if r.get("stdout"):
-                        success_log += f"```\n{r['stdout'][:2000]}\n```\n"
-                append_to_log(md_path, f"Attempt {attempt} Result", success_log)
-                break
-
-            # Failed -- build feedback
-            failures = [r for r in executed if not r["success"]]
-            print(f"\n  [FAIL] {len(failures)}/{len(executed)} failed")
-
-            # Log failures
-            fail_log = f"FAILED: {len(failures)}/{len(executed)}\n\n"
-            for r in failures:
-                fail_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
+            # Log execution
+            exec_log = ""
+            for r in executed:
+                exec_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
                 if r.get("stderr"):
-                    fail_log += f"stderr:\n```\n{r['stderr'][:2000]}\n```\n"
+                    exec_log += f"stderr:\n```\n{r['stderr'][:2000]}\n```\n"
                 if r.get("stdout"):
-                    fail_log += f"stdout:\n```\n{r['stdout'][:1000]}\n```\n"
-            append_to_log(md_path, f"Attempt {attempt} Execution", fail_log)
+                    exec_log += f"stdout:\n```\n{r['stdout'][:2000]}\n```\n"
+            append_to_log(md_path, f"Attempt {attempt} Execution", exec_log)
 
+            # Step 6: Ask the LLM to verify — IT decides pass/fail
             if attempt > max_retries:
                 print(f"\n[FAIL] Max retries ({max_retries}) reached.")
                 append_to_log(md_path, "Final Result",
                               f"FAILED after {max_retries} retries.")
                 break
 
-            print(f"\n[5] Sending errors back to ChatGPT...")
-            current_prompt = build_error_feedback(failures)
-            append_to_log(md_path, f"Feedback (Attempt {attempt})",
+            print(f"\n[5] Asking ChatGPT to verify output...")
+            current_prompt = build_verification_prompt(executed, prompt)
+            append_to_log(md_path, f"Verification Request (Attempt {attempt})",
                           f"```\n{current_prompt}\n```")
 
     print(f"\nLog: {md_path}")

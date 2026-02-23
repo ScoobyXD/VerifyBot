@@ -2,6 +2,7 @@
 .browser_profile/
 raw_md/
 programs/
+outputs/
 context/
 __pycache__/
 *.pyc
