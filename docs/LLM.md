@@ -143,3 +143,6 @@ playwright install chromium
 5. Context files in `context/` are auto-generated. Do not manually edit.
 6. The `programs/` directory is transient -- cleared between retry attempts.
 7. `raw_md/` contains full pipeline transcripts for debugging VerifyBot itself.
+8. **Dotfiles lose their leading dot when downloaded from Claude.ai.** After downloading, rename `gitignore` to `.gitignore` and `env` to `.env`. This is a browser download artifact, not a bug in the code.
+9. **Pycache auto-cleanup.** `main.py` deletes all `__pycache__/` directories on startup. You do NOT need to manually delete them when updating files.
+10. **Browser login persistence.** ChatGPT cookies are saved in `.browser_profile/`. Run `python main.py --login` once to log in manually. If the browser opens without being logged in, your `.browser_profile/` directory may have been deleted or moved -- run `--login` again. Do NOT delete `.browser_profile/` unless you want to re-login.

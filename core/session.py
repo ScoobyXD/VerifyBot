@@ -12,6 +12,7 @@ Usage:
         fix = s.followup("That has a bug, fix it")
 """
 
+import re
 import time
 from pathlib import Path
 
@@ -41,7 +42,11 @@ class ChatGPTSession:
             viewport={"width": 1280, "height": 900},
             args=["--disable-blink-features=AutomationControlled"],
         )
-        self._page = self._ctx.new_page()
+        # Reuse existing tab to avoid double-tab issue
+        if self._ctx.pages:
+            self._page = self._ctx.pages[0]
+        else:
+            self._page = self._ctx.new_page()
         self._navigate_to_new_chat()
         return self
 
@@ -143,9 +148,253 @@ class ChatGPTSession:
         return False
 
     def _extract_last_response(self) -> str:
+        """Extract the last assistant message with code fences intact.
+
+        Strategy: find every <pre><code> block in the message, extract
+        the code text with newlines from each one (using JS on the element
+        directly), detect the language, and build the response by combining
+        prose from inner_text() with properly fenced code blocks.
+        """
+        last = None
         for sel in S.ASSISTANT_MESSAGE_SELECTORS:
             messages = self._page.query_selector_all(sel)
             if messages:
                 last = messages[-1]
-                return last.inner_text().strip()
-        return "(no response found)"
+                break
+
+        if not last:
+            return "(no response found)"
+
+        # Extract structured code blocks from <pre><code> elements
+        code_blocks = self._get_code_blocks_from_dom(last)
+
+        if not code_blocks:
+            # No <pre><code> found — return raw inner_text
+            return last.inner_text().strip()
+
+        # We have code blocks. Now build the full response:
+        # Get the full text, then replace mangled code with fenced versions.
+        full_text = last.inner_text().strip()
+        return self._insert_fences(full_text, code_blocks)
+
+    def _get_code_blocks_from_dom(self, message_el) -> list:
+        """Extract code text (with newlines) from each <pre><code> in the message.
+
+        Returns [{language: str, code: str}] where code has proper newlines.
+        """
+        results = []
+
+        pres = message_el.query_selector_all("pre")
+        for pre in pres:
+            code_el = pre.query_selector("code")
+            if not code_el:
+                continue
+
+            # --- Detect language ---
+            lang = ""
+            try:
+                cls = code_el.get_attribute("class") or ""
+                m = re.search(r"language-(\w+)", cls)
+                if m:
+                    lang = m.group(1).lower()
+            except Exception:
+                pass
+
+            if not lang:
+                try:
+                    cls = pre.get_attribute("class") or ""
+                    m = re.search(r"language-(\w+)", cls)
+                    if m:
+                        lang = m.group(1).lower()
+                except Exception:
+                    pass
+
+            if not lang:
+                try:
+                    # ChatGPT shows language label in a header span above the code
+                    header_span = pre.query_selector("div span")
+                    if header_span:
+                        t = header_span.inner_text().strip().lower()
+                        known_langs = {
+                            "python", "bash", "sh", "shell", "c", "cpp", "c++",
+                            "javascript", "typescript", "rust", "java", "go",
+                            "ruby", "powershell", "sql", "html", "css", "json",
+                            "yaml", "makefile", "toml", "r", "matlab", "lua",
+                        }
+                        if t in known_langs:
+                            lang = t
+                except Exception:
+                    pass
+
+            # --- Extract code text with newlines ---
+            code = self._get_code_text(code_el)
+
+            if code and len(code.strip()) > 5:
+                results.append({
+                    "language": lang or "python",
+                    "code": code.strip(),
+                })
+
+        return results
+
+    def _get_code_text(self, code_el) -> str:
+        """Get the text content of a <code> element with newlines preserved.
+
+        Tries multiple strategies because ChatGPT's DOM varies.
+        """
+        # Strategy 1: JS that walks text nodes and respects line breaks
+        try:
+            text = code_el.evaluate("""
+                el => {
+                    // Collect text preserving newline characters
+                    let lines = [];
+                    let currentLine = '';
+
+                    function collect(node) {
+                        if (node.nodeType === Node.TEXT_NODE) {
+                            let text = node.textContent;
+                            let parts = text.split('\\n');
+                            for (let i = 0; i < parts.length; i++) {
+                                currentLine += parts[i];
+                                if (i < parts.length - 1) {
+                                    lines.push(currentLine);
+                                    currentLine = '';
+                                }
+                            }
+                            return;
+                        }
+                        if (node.nodeName === 'BR') {
+                            lines.push(currentLine);
+                            currentLine = '';
+                            return;
+                        }
+                        // Skip buttons and non-content elements
+                        if (node.nodeName === 'BUTTON') return;
+
+                        for (const child of node.childNodes) {
+                            collect(child);
+                        }
+                    }
+
+                    collect(el);
+                    if (currentLine) lines.push(currentLine);
+
+                    let result = lines.join('\\n');
+
+                    // If that produced a single long line, try innerText
+                    if (result.length > 80 && result.indexOf('\\n') === -1) {
+                        let alt = el.innerText;
+                        if (alt && alt.indexOf('\\n') !== -1) {
+                            return alt;
+                        }
+                    }
+
+                    return result;
+                }
+            """)
+            if text and len(text.strip()) > 5:
+                return text
+        except Exception:
+            pass
+
+        # Strategy 2: plain innerText
+        try:
+            text = code_el.inner_text()
+            if text:
+                return text
+        except Exception:
+            pass
+
+        # Strategy 3: textContent (last resort, may lose newlines)
+        try:
+            return code_el.text_content() or ""
+        except Exception:
+            return ""
+
+    def _insert_fences(self, full_text: str, code_blocks: list) -> str:
+        """Replace mangled code in inner_text with properly fenced versions.
+
+        inner_text() produces something like:
+            "Here is the code:\npython\nCopy code\nimport math\ndef hello():\n..."
+        or sometimes all code on one line:
+            "Here is the code:\nPythonimport mathdef hello():    print('hi')"
+
+        We find where each code block appears (possibly mangled) and replace
+        it with a proper ```language ... ``` fenced block.
+        """
+        result = full_text
+
+        for block in code_blocks:
+            lang = block["language"]
+            code = block["code"]
+            fenced = f"\n```{lang}\n{code}\n```\n"
+
+            # The inner_text version may have:
+            # 1. "Python\nCopy code\n" prefix before the code
+            # 2. "Copy code\n" prefix
+            # 3. Language name glued to first line: "Pythonimport math..."
+            # 4. Code with newlines intact
+            # 5. Code as one long line (no newlines)
+
+            replaced = False
+
+            # Try finding "Language\nCopy code\n<first line of code>"
+            first_line = code.split("\n")[0].strip()
+            last_line = code.split("\n")[-1].strip()
+
+            # Pattern: "Python\nCopy code\n" or "python\nCopy code\n"
+            for prefix_pattern in [
+                f"{lang}\nCopy code\n",
+                f"{lang.capitalize()}\nCopy code\n",
+                f"{lang.upper()}\nCopy code\n",
+                "Copy code\n",
+            ]:
+                idx = result.find(prefix_pattern)
+                if idx >= 0:
+                    # Find end of code region: look for last line of code
+                    search_start = idx + len(prefix_pattern)
+                    end_idx = result.find(last_line, search_start)
+                    if end_idx >= 0:
+                        end_idx += len(last_line)
+                        result = result[:idx] + fenced + result[end_idx:]
+                        replaced = True
+                        break
+
+            if replaced:
+                continue
+
+            # Try finding code on one line (no newlines version)
+            code_no_nl = code.replace("\n", "")
+            # Check for language prefix glued on
+            for prefix in [lang.capitalize(), lang, lang.upper(), ""]:
+                search = prefix + code_no_nl[:80]
+                idx = result.find(search)
+                if idx >= 0:
+                    # Find end — look for last ~40 chars of the mangled code
+                    end_search = code_no_nl[-40:]
+                    end_idx = result.find(end_search, idx)
+                    if end_idx >= 0:
+                        end_idx += len(end_search)
+                    else:
+                        end_idx = idx + len(search)
+                    result = result[:idx] + fenced + result[end_idx:]
+                    replaced = True
+                    break
+
+            if replaced:
+                continue
+
+            # Try finding first line of code directly
+            if first_line and first_line in result:
+                idx = result.find(first_line)
+                end_idx = result.find(last_line, idx)
+                if end_idx >= 0:
+                    end_idx += len(last_line)
+                    result = result[:idx] + fenced + result[end_idx:]
+                    replaced = True
+
+            if not replaced:
+                # Last resort: append the fenced block
+                result = result + "\n" + fenced
+
+        return result

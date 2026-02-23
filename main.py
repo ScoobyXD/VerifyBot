@@ -28,6 +28,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# Clean stale bytecode on startup (prevents import issues after file updates)
+for _cache in Path(__file__).resolve().parent.rglob("__pycache__"):
+    if _cache.is_dir():
+        import shutil
+        shutil.rmtree(_cache, ignore_errors=True)
+
 from core.session import ChatGPTSession
 from skills.chatgpt_skill import save_response, append_to_log
 from skills.ssh_skill import ssh_run, ssh_run_detached, sftp_upload, REMOTE_WORK_DIR
@@ -132,15 +138,14 @@ def build_initial_prompt(user_prompt: str, context: str, target: str,
         f"Code will be deployed and executed on: {target_desc}\n\n"
         f"{context}\n\n"
         f"RULES:\n"
-        f"- Respond with a COMPLETE Python 3 script in a ```python block, "
-        f"OR bash commands in a ```bash block, OR both.\n"
-        f"- Use ONLY packages shown in the pip list above (or stdlib).\n"
-        f"- ASCII only. No emojis.\n"
-        f"- Print clear status messages.\n"
+        f"- Put all code inside fenced code blocks (```language ... ```).\n"
+        f"- Use whatever language, tools, or packages you think are best.\n"
+        f"- If you need a package installed, include INSTALL: package1, package2 "
+        f"at the top of your response.\n"
         f"- If this will take longer than 30 seconds to run, include "
         f"TIMEOUT: <seconds> at the top of your response.\n"
-        f"- If you need a package installed, include "
-        f"INSTALL: package1, package2 at the top.\n\n"
+        f"- ASCII only in code output. No emojis.\n"
+        f"- Print clear status messages so I can see what happened.\n\n"
         f"TASK: {user_prompt}\n"
     )
 
@@ -486,6 +491,10 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             print(f"[{'RETRY ' + str(attempt-1) if attempt > 1 else 'ATTEMPT 1'}]")
             print(f"{'='*60}")
 
+            # Log what we're sending to the LLM
+            append_to_log(md_path, f"Prompt Sent (Attempt {attempt})",
+                          f"```\n{current_prompt}\n```")
+
             # Step 3: Send to LLM
             print(f"\n[2] Sending to ChatGPT ({len(current_prompt)} chars)...")
             if is_followup:
@@ -494,6 +503,7 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                 response = session.prompt(current_prompt)
             is_followup = True
 
+            # Log what we got back
             append_to_log(md_path, f"LLM Response (Attempt {attempt})", response)
 
             # Handle install requests
@@ -520,6 +530,19 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
 
             scripts, commands = classify_blocks(blocks)
             print(f"  Found: {len(scripts)} script(s), {len(commands)} command(s)")
+
+            if not scripts and not commands:
+                print("  [WARN] No executable code found after classification.")
+                append_to_log(md_path, f"Attempt {attempt}",
+                              "Extracted blocks but none were executable scripts or commands.")
+                current_prompt = (
+                    "Your response contained code but I couldn't identify any "
+                    "executable scripts or commands. Please put your code inside "
+                    "a fenced code block like:\n\n"
+                    "```python\n# your code here\n```\n\n"
+                    "or\n\n```bash\n# your commands here\n```"
+                )
+                continue
 
             # Step 5: Execute everything
             print(f"\n[4] Executing on {resolved}...")
@@ -579,12 +602,28 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             all_ok = all(r["success"] for r in executed)
             if all_ok:
                 print(f"\n[DONE] All code executed successfully!")
-                append_to_log(md_path, f"Attempt {attempt} Result", "SUCCESS")
+                # Log success with output
+                success_log = "SUCCESS\n\n"
+                for r in executed:
+                    success_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
+                    if r.get("stdout"):
+                        success_log += f"```\n{r['stdout'][:2000]}\n```\n"
+                append_to_log(md_path, f"Attempt {attempt} Result", success_log)
                 break
 
             # Failed -- build feedback
             failures = [r for r in executed if not r["success"]]
             print(f"\n  [FAIL] {len(failures)}/{len(executed)} failed")
+
+            # Log failures
+            fail_log = f"FAILED: {len(failures)}/{len(executed)}\n\n"
+            for r in failures:
+                fail_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
+                if r.get("stderr"):
+                    fail_log += f"stderr:\n```\n{r['stderr'][:2000]}\n```\n"
+                if r.get("stdout"):
+                    fail_log += f"stdout:\n```\n{r['stdout'][:1000]}\n```\n"
+            append_to_log(md_path, f"Attempt {attempt} Execution", fail_log)
 
             if attempt > max_retries:
                 print(f"\n[FAIL] Max retries ({max_retries}) reached.")

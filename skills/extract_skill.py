@@ -52,10 +52,16 @@ class CodeBlock:
 
 
 def extract_blocks(text: str) -> List[CodeBlock]:
-    """Extract all fenced code blocks from an LLM response."""
+    """Extract all fenced code blocks from an LLM response.
+
+    Primary: standard ```language ... ``` fences.
+    Fallback: if no fences found, look for indented code blocks or
+    recognizable code patterns (def/import/class/#!/...).
+    """
     blocks = []
     seen = set()
 
+    # Primary: fenced blocks
     for match in FENCED_BLOCK_RE.finditer(text):
         lang = match.group(1).strip().lower() or "txt"
         code = match.group(2).strip()
@@ -63,7 +69,106 @@ def extract_blocks(text: str) -> List[CodeBlock]:
             seen.add(code)
             blocks.append(CodeBlock(language=lang, code=code, index=len(blocks)))
 
+    if blocks:
+        return blocks
+
+    # =====================================================================
+    # FALLBACK: No fences found. The text is likely from inner_text() with
+    # fences stripped. Find the largest contiguous region of code.
+    #
+    # Strategy: score each line as "code" or "prose", then find the longest
+    # run of code lines and treat it as one block.
+    # =====================================================================
+    lines = text.split("\n")
+    scored = []  # (line_index, is_code, line)
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Definite code indicators
+        is_code = (
+            stripped.startswith(("def ", "class ", "import ", "from ", "if __name__",
+                                "#!/", "#include", "int main", "void ", "fn ")) or
+            stripped.startswith(("    ", "\t")) and len(stripped) > 1 or
+            re.match(r"^\s*(if|elif|else|for|while|try|except|with|return|yield|raise|pass|break|continue)\b", stripped) or
+            re.match(r"^\s*\w+\s*=\s*", stripped) or
+            re.match(r"^\s*\w+\s*[+\-*/]=", stripped) or  # augmented assignment: i += 2
+            re.match(r"^\s*\w+\.\w+\(", stripped) or
+            re.match(r"^\s*\w+\s*\(", stripped) or  # function calls like main()
+            re.match(r"^\s*print\s*\(", stripped) or
+            re.match(r"^\s*#\s", stripped) or  # comments
+            stripped == ""  # blank lines (neutral, OK within code)
+        )
+
+        # Definite prose indicators (override)
+        # Be conservative — only flag things that are clearly English sentences
+        is_prose = (
+            re.match(r"^(Here |This version|The previous|It |To avoid|I |You |Note:|Now |If you |Run |Save |Usage|Why |So |Your )", stripped) or
+            re.match(r"^[A-Z][a-z]+ [a-z]+ [a-z]+ [a-z]+", stripped) and not any(kw in stripped for kw in ["import ", "from ", "class ", "def "]) or  # 4+ word sentence
+            stripped.startswith(("- ", "* ", "> ")) or  # Markdown list/quote
+            False
+        )
+
+        if is_prose:
+            scored.append((i, False, line))
+        else:
+            scored.append((i, is_code, line))
+
+    # Find the longest contiguous run of code lines
+    # Allow up to 2 consecutive blank lines within a code run
+    best_start, best_end, best_len = 0, 0, 0
+    run_start = None
+    blank_streak = 0
+
+    for i, (_, is_code, line) in enumerate(scored):
+        stripped = line.strip()
+        if is_code:
+            if stripped == "":
+                blank_streak += 1
+                if blank_streak > 3:  # Python convention: 2 blank lines between top-level defs
+                    # Too many blanks — end this run
+                    run_len = i - blank_streak - run_start if run_start is not None else 0
+                    if run_len > best_len:
+                        best_start, best_end, best_len = run_start, i - blank_streak, run_len
+                    run_start = None
+                    blank_streak = 0
+            else:
+                blank_streak = 0
+                if run_start is None:
+                    run_start = i
+        else:
+            if run_start is not None:
+                run_len = i - run_start
+                if run_len > best_len:
+                    best_start, best_end, best_len = run_start, i, run_len
+            run_start = None
+            blank_streak = 0
+
+    # Check final run
+    if run_start is not None:
+        run_len = len(scored) - run_start
+        if run_len > best_len:
+            best_start, best_end, best_len = run_start, len(scored), run_len
+
+    if best_len >= 3:
+        code_lines = [scored[i][2] for i in range(best_start, best_end)]
+        code = "\n".join(code_lines).strip()
+        if code and len(code) > 20:
+            lang = _guess_language(code)
+            blocks.append(CodeBlock(language=lang, code=code, index=0))
+
     return blocks
+
+
+def _guess_language(code: str) -> str:
+    """Guess language from code content."""
+    if "def " in code or "import " in code or "print(" in code:
+        return "python"
+    if "#include" in code or "int main" in code:
+        return "c"
+    if code.startswith("#!/bin/bash") or code.startswith("#!/bin/sh"):
+        return "bash"
+    return "txt"
 
 
 def extract_filename_hint(text: str) -> str | None:
