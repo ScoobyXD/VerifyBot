@@ -662,8 +662,6 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
 
             print(f"\n[5] Asking ChatGPT to verify output...")
             current_prompt = build_verification_prompt(executed, prompt)
-            append_to_log(md_path, f"Verification Request (Attempt {attempt})",
-                          f"```\n{current_prompt}\n```")
 
     print(f"\nLog: {md_path}")
 
