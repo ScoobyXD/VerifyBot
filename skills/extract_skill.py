@@ -65,6 +65,36 @@ def extract_blocks(text: str) -> List[CodeBlock]:
     for match in FENCED_BLOCK_RE.finditer(text):
         lang = match.group(1).strip().lower() or "txt"
         code = match.group(2).strip()
+
+        # Strip language label leaked into code (e.g. "Pythonimport math...")
+        # This happens when the DOM extraction glues the label to the first line
+        known_labels = {
+            "python", "bash", "sh", "shell", "c", "cpp", "javascript",
+            "typescript", "rust", "java", "go", "ruby", "powershell",
+        }
+        for label in known_labels:
+            if code.lower().startswith(label) and len(code) > len(label):
+                next_char = code[len(label)]
+                # If label is glued to code (e.g. "Pythonimport")
+                if next_char not in (" ", "\n", "\r", "(", "#"):
+                    code = code[len(label):]
+                    if not lang or lang == "txt":
+                        lang = label
+                    break
+                # If label is on its own line
+                elif code[:len(label) + 1] == label + "\n":
+                    code = code[len(label) + 1:]
+                    if not lang or lang == "txt":
+                        lang = label
+                    break
+
+        # Strip "Copy code" artifact
+        if code.startswith("Copy code\n"):
+            code = code[len("Copy code\n"):]
+        elif code.startswith("Copy\n"):
+            code = code[len("Copy\n"):]
+
+        code = code.strip()
         if code and code not in seen:
             seen.add(code)
             blocks.append(CodeBlock(language=lang, code=code, index=len(blocks)))
@@ -90,13 +120,15 @@ def extract_blocks(text: str) -> List[CodeBlock]:
             stripped.startswith(("def ", "class ", "import ", "from ", "if __name__",
                                 "#!/", "#include", "int main", "void ", "fn ")) or
             stripped.startswith(("    ", "\t")) and len(stripped) > 1 or
+            stripped.startswith(('"""', "'''")) or  # docstrings
+            stripped.startswith("@") or  # decorators
             re.match(r"^\s*(if|elif|else|for|while|try|except|with|return|yield|raise|pass|break|continue)\b", stripped) or
             re.match(r"^\s*\w+\s*=\s*", stripped) or
             re.match(r"^\s*\w+\s*[+\-*/]=", stripped) or  # augmented assignment: i += 2
             re.match(r"^\s*\w+\.\w+\(", stripped) or
             re.match(r"^\s*\w+\s*\(", stripped) or  # function calls like main()
             re.match(r"^\s*print\s*\(", stripped) or
-            re.match(r"^\s*#\s", stripped) or  # comments
+            re.match(r"^\s*#", stripped) or  # comments (including shebang)
             stripped == ""  # blank lines (neutral, OK within code)
         )
 
@@ -153,6 +185,27 @@ def extract_blocks(text: str) -> List[CodeBlock]:
     if best_len >= 3:
         code_lines = [scored[i][2] for i in range(best_start, best_end)]
         code = "\n".join(code_lines).strip()
+
+        # Strip leading language label that ChatGPT's UI leaks into inner_text
+        # e.g. first line is just "Python" or "Bash" before the actual code
+        if code:
+            first_line = code.split("\n")[0].strip()
+            known_labels = {
+                "python", "bash", "sh", "shell", "c", "cpp", "c++",
+                "javascript", "typescript", "rust", "java", "go", "ruby",
+                "powershell", "sql", "html", "css", "json", "yaml",
+                "makefile", "toml", "r", "matlab", "lua",
+            }
+            if first_line.lower() in known_labels:
+                # Remove the label line
+                code = "\n".join(code.split("\n")[1:]).strip()
+
+            # Also strip "Copy code" line that ChatGPT UI sometimes leaks
+            if code.startswith("Copy code\n"):
+                code = code[len("Copy code\n"):]
+            elif code.startswith("Copy\n"):
+                code = code[len("Copy\n"):]
+
         if code and len(code) > 20:
             lang = _guess_language(code)
             blocks.append(CodeBlock(language=lang, code=code, index=0))
