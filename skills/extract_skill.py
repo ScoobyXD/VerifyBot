@@ -1,38 +1,25 @@
 """
-extract_skill.py -- Extract code blocks from LLM markdown responses.
+extract_skill.py -- Extract code blocks from LLM responses.
 
-Handles:
-    - Fenced code blocks (```python ... ```)
-    - Language detection and file extension mapping
-    - Two-way classification: script (save as file) vs command (run directly)
+Two paths:
+1. FENCED: Standard ```language ... ``` blocks. Parse with regex.
+2. UNFENCED: The response text has code without fences (from inner_text()).
+   Find the first line that is definitely code, take everything from there
+   to the last line that is definitely code. That's your script.
 
-Usage:
-    from skills.extract_skill import extract_blocks, classify_blocks
-    blocks = extract_blocks(llm_response_text)
-    scripts, commands = classify_blocks(blocks)
+That's it. No scoring, no heuristics, no longest-run detection.
 """
 
 import re
 from dataclasses import dataclass
-from typing import List, Tuple
-
+from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
-# Code block extraction
+# Data
 # ---------------------------------------------------------------------------
-
-FENCED_BLOCK_RE = re.compile(
-    r"```(\w*)\s*\n"
-    r"(?:Copy\s*code\s*\n)?"
-    r"(.*?)"
-    r"\n```",
-    re.DOTALL,
-)
-
 
 @dataclass
 class CodeBlock:
-    """A single extracted code block."""
     language: str
     code: str
     index: int
@@ -43,174 +30,212 @@ class CodeBlock:
             "python": ".py", "py": ".py",
             "bash": ".sh", "sh": ".sh", "shell": ".sh",
             "c": ".c", "cpp": ".cpp", "c++": ".cpp",
-            "javascript": ".js", "js": ".js",
             "rust": ".rs", "java": ".java",
-            "json": ".json", "yaml": ".yaml", "yml": ".yaml",
-            "html": ".html", "css": ".css",
+            "javascript": ".js", "js": ".js",
+            "typescript": ".ts", "ts": ".ts",
         }
-        return ext_map.get(self.language.lower(), ".txt")
+        return ext_map.get(self.language, ".py")
 
+
+# ---------------------------------------------------------------------------
+# Regex for fenced code blocks
+# ---------------------------------------------------------------------------
+
+FENCED_BLOCK_RE = re.compile(
+    r"```(\w*)\s*\n"
+    r"(?:Copy\s*code\s*\n)?"
+    r"(.*?)"
+    r"\n```",
+    re.DOTALL,
+)
+
+# Language labels that ChatGPT's UI leaks into the text
+KNOWN_LANG_LABELS = {
+    "python", "bash", "sh", "shell", "c", "cpp", "c++",
+    "javascript", "typescript", "rust", "java", "go", "ruby",
+    "powershell", "sql", "html", "css", "json", "yaml",
+    "makefile", "toml", "r", "matlab", "lua",
+}
+
+# Lines that definitely start code (anchors)
+CODE_START_MARKERS = (
+    "#!/",
+    "import ",
+    "from ",
+    "def ",
+    "class ",
+    "#include",
+    "int main",
+    "fn ",
+    "package ",
+    "using ",
+)
+
+
+# ---------------------------------------------------------------------------
+# Main extraction
+# ---------------------------------------------------------------------------
 
 def extract_blocks(text: str) -> List[CodeBlock]:
-    """Extract all fenced code blocks from an LLM response.
+    """Extract code blocks from LLM response text.
 
-    Primary: standard ```language ... ``` fences.
-    Fallback: if no fences found, look for indented code blocks or
-    recognizable code patterns (def/import/class/#!/...).
+    Path 1: If fenced blocks exist, use them.
+    Path 2: If no fences, find code by start markers and take the whole block.
     """
+    blocks = _try_fenced(text)
+    if blocks:
+        return blocks
+
+    blocks = _try_unfenced(text)
+    return blocks
+
+
+def _try_fenced(text: str) -> List[CodeBlock]:
+    """Try to extract fenced ```lang ... ``` blocks."""
     blocks = []
     seen = set()
 
-    # Primary: fenced blocks
     for match in FENCED_BLOCK_RE.finditer(text):
         lang = match.group(1).strip().lower() or "txt"
         code = match.group(2).strip()
 
-        # Strip language label leaked into code (e.g. "Pythonimport math...")
-        # This happens when the DOM extraction glues the label to the first line
-        known_labels = {
-            "python", "bash", "sh", "shell", "c", "cpp", "javascript",
-            "typescript", "rust", "java", "go", "ruby", "powershell",
-        }
-        for label in known_labels:
-            if code.lower().startswith(label) and len(code) > len(label):
-                next_char = code[len(label)]
-                # If label is glued to code (e.g. "Pythonimport")
-                if next_char not in (" ", "\n", "\r", "(", "#"):
-                    code = code[len(label):]
-                    if not lang or lang == "txt":
-                        lang = label
-                    break
-                # If label is on its own line
-                elif code[:len(label) + 1] == label + "\n":
-                    code = code[len(label) + 1:]
-                    if not lang or lang == "txt":
-                        lang = label
-                    break
-
-        # Strip "Copy code" artifact
-        if code.startswith("Copy code\n"):
-            code = code[len("Copy code\n"):]
-        elif code.startswith("Copy\n"):
-            code = code[len("Copy\n"):]
-
+        # Clean: strip language label glued to first line
+        code = _strip_leading_label(code, lang)
+        code = _strip_copy_code(code)
         code = code.strip()
+
         if code and code not in seen:
             seen.add(code)
             blocks.append(CodeBlock(language=lang, code=code, index=len(blocks)))
 
-    if blocks:
-        return blocks
+    return blocks
 
-    # =====================================================================
-    # FALLBACK: No fences found. The text is likely from inner_text() with
-    # fences stripped. Find the largest contiguous region of code.
-    #
-    # Strategy: score each line as "code" or "prose", then find the longest
-    # run of code lines and treat it as one block.
-    # =====================================================================
+
+def _try_unfenced(text: str) -> List[CodeBlock]:
+    """Extract code when there are no fences.
+
+    Strategy:
+    1. Find the first line that starts with a CODE_START_MARKER
+    2. Take everything from there to the end of the text
+    3. Strip trailing prose lines from the bottom
+
+    This works because ChatGPT always puts code AFTER its prose intro,
+    and any trailing prose ("Run this with...", "This will...") is short.
+    """
     lines = text.split("\n")
-    scored = []  # (line_index, is_code, line)
 
+    # Step 1: Find the first code start line
+    code_start = None
     for i, line in enumerate(lines):
         stripped = line.strip()
 
-        # Definite code indicators
-        is_code = (
-            stripped.startswith(("def ", "class ", "import ", "from ", "if __name__",
-                                "#!/", "#include", "int main", "void ", "fn ")) or
-            stripped.startswith(("    ", "\t")) and len(stripped) > 1 or
-            stripped.startswith(('"""', "'''")) or  # docstrings
-            stripped.startswith("@") or  # decorators
-            re.match(r"^\s*(if|elif|else|for|while|try|except|with|return|yield|raise|pass|break|continue)\b", stripped) or
-            re.match(r"^\s*\w+\s*=\s*", stripped) or
-            re.match(r"^\s*\w+\s*[+\-*/]=", stripped) or  # augmented assignment: i += 2
-            re.match(r"^\s*\w+\.\w+\(", stripped) or
-            re.match(r"^\s*\w+\s*\(", stripped) or  # function calls like main()
-            re.match(r"^\s*print\s*\(", stripped) or
-            re.match(r"^\s*#", stripped) or  # comments (including shebang)
-            stripped == ""  # blank lines (neutral, OK within code)
-        )
+        # Skip if this is a known language label on its own line
+        if stripped.lower() in KNOWN_LANG_LABELS:
+            continue
+        # Skip "Copy code" artifact
+        if stripped.lower() in ("copy code", "copy"):
+            continue
 
-        # Definite prose indicators (override)
-        # Be conservative — only flag things that are clearly English sentences
-        is_prose = (
-            re.match(r"^(Here |This version|The previous|It |To avoid|I |You |Note:|Now |If you |Run |Save |Usage|Why |So |Your )", stripped) or
-            re.match(r"^[A-Z][a-z]+ [a-z]+ [a-z]+ [a-z]+", stripped) and not any(kw in stripped for kw in ["import ", "from ", "class ", "def "]) or  # 4+ word sentence
-            stripped.startswith(("- ", "* ", "> ")) or  # Markdown list/quote
-            False
-        )
+        # Check for code start markers
+        for marker in CODE_START_MARKERS:
+            if stripped.startswith(marker):
+                code_start = i
+                break
+        if code_start is not None:
+            break
 
-        if is_prose:
-            scored.append((i, False, line))
-        else:
-            scored.append((i, is_code, line))
+    if code_start is None:
+        return []
 
-    # Find the longest contiguous run of code lines
-    # Allow up to 2 consecutive blank lines within a code run
-    best_start, best_end, best_len = 0, 0, 0
-    run_start = None
-    blank_streak = 0
+    # Step 2: Take everything from code_start to end
+    candidate_lines = lines[code_start:]
 
-    for i, (_, is_code, line) in enumerate(scored):
-        stripped = line.strip()
-        if is_code:
-            if stripped == "":
-                blank_streak += 1
-                if blank_streak > 3:  # Python convention: 2 blank lines between top-level defs
-                    # Too many blanks — end this run
-                    run_len = i - blank_streak - run_start if run_start is not None else 0
-                    if run_len > best_len:
-                        best_start, best_end, best_len = run_start, i - blank_streak, run_len
-                    run_start = None
-                    blank_streak = 0
-            else:
-                blank_streak = 0
-                if run_start is None:
-                    run_start = i
-        else:
-            if run_start is not None:
-                run_len = i - run_start
-                if run_len > best_len:
-                    best_start, best_end, best_len = run_start, i, run_len
-            run_start = None
-            blank_streak = 0
+    # Step 3: Strip trailing prose from the bottom
+    # Walk backwards, removing lines that are clearly English prose
+    while candidate_lines:
+        last = candidate_lines[-1].strip()
+        if not last:
+            candidate_lines.pop()  # remove trailing blank lines
+            continue
+        if _is_prose(last):
+            candidate_lines.pop()
+            continue
+        break
 
-    # Check final run
-    if run_start is not None:
-        run_len = len(scored) - run_start
-        if run_len > best_len:
-            best_start, best_end, best_len = run_start, len(scored), run_len
+    code = "\n".join(candidate_lines).strip()
 
-    if best_len >= 3:
-        code_lines = [scored[i][2] for i in range(best_start, best_end)]
-        code = "\n".join(code_lines).strip()
+    if not code or len(code) < 10:
+        return []
 
-        # Strip leading language label that ChatGPT's UI leaks into inner_text
-        # e.g. first line is just "Python" or "Bash" before the actual code
-        if code:
-            first_line = code.split("\n")[0].strip()
-            known_labels = {
-                "python", "bash", "sh", "shell", "c", "cpp", "c++",
-                "javascript", "typescript", "rust", "java", "go", "ruby",
-                "powershell", "sql", "html", "css", "json", "yaml",
-                "makefile", "toml", "r", "matlab", "lua",
-            }
-            if first_line.lower() in known_labels:
-                # Remove the label line
-                code = "\n".join(code.split("\n")[1:]).strip()
+    lang = _guess_language(code)
+    return [CodeBlock(language=lang, code=code, index=0)]
 
-            # Also strip "Copy code" line that ChatGPT UI sometimes leaks
-            if code.startswith("Copy code\n"):
-                code = code[len("Copy code\n"):]
-            elif code.startswith("Copy\n"):
-                code = code[len("Copy\n"):]
 
-        if code and len(code) > 20:
-            lang = _guess_language(code)
-            blocks.append(CodeBlock(language=lang, code=code, index=0))
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    return blocks
+def _strip_leading_label(code: str, detected_lang: str) -> str:
+    """Strip language label leaked into code by ChatGPT UI.
+
+    E.g. first line is just "Python" or "Bash", or glued: "Pythonimport math"
+    """
+    if not code:
+        return code
+
+    first_line = code.split("\n")[0].strip()
+
+    # Label on its own line
+    if first_line.lower() in KNOWN_LANG_LABELS:
+        return "\n".join(code.split("\n")[1:])
+
+    # Label glued to first token: "Pythonimport math" -> "import math"
+    for label in KNOWN_LANG_LABELS:
+        if first_line.lower().startswith(label) and len(first_line) > len(label):
+            rest = first_line[len(label):]
+            if rest[0] not in (" ", "\n"):  # glued
+                remaining_lines = code.split("\n")[1:]
+                return rest + "\n" + "\n".join(remaining_lines)
+
+    return code
+
+
+def _strip_copy_code(code: str) -> str:
+    """Strip 'Copy code' artifact from ChatGPT UI."""
+    if code.startswith("Copy code\n"):
+        return code[len("Copy code\n"):]
+    if code.startswith("Copy\n"):
+        return code[len("Copy\n"):]
+    return code
+
+
+def _is_prose(line: str) -> bool:
+    """Return True if line is clearly English prose, not code."""
+    s = line.strip()
+    if not s:
+        return False
+
+    # Starts with common English sentence openers
+    prose_starters = (
+        "Here ", "This ", "The ", "It ", "I ", "You ", "Note", "Now ",
+        "If you", "Run ", "Save ", "Usage", "Why ", "So ", "Your ",
+        "To ", "Let ", "We ", "For ", "In ", "That ", "These ",
+        "Make sure", "Please ", "Copy ", "Output", "Example",
+        "Explanation", "How ", "What ", "When ", "Where ",
+    )
+    if any(s.startswith(p) for p in prose_starters):
+        return True
+
+    # Markdown list items
+    if s.startswith(("- ", "* ", "> ", "1. ", "2. ", "3. ")):
+        return True
+
+    # English sentence: starts uppercase, has spaces, ends with period
+    if (s[0].isupper() and " " in s and s.endswith((".", "!", "?", ":"))
+            and not s.startswith(("print(", "return ", "import ", "from ", "def ", "class "))):
+        return True
+
+    return False
 
 
 def _guess_language(code: str) -> str:
@@ -221,71 +246,64 @@ def _guess_language(code: str) -> str:
         return "c"
     if code.startswith("#!/bin/bash") or code.startswith("#!/bin/sh"):
         return "bash"
-    return "txt"
+    return "python"
 
 
-def extract_filename_hint(text: str) -> str | None:
-    """Try to find a suggested filename in the LLM response."""
+# ---------------------------------------------------------------------------
+# Metadata extraction
+# ---------------------------------------------------------------------------
+
+def extract_filename_hint(text: str) -> Optional[str]:
+    """Try to extract a filename from the LLM response."""
     patterns = [
-        r"save\s+(?:it\s+)?as\s+[`\"']?(\S+\.\w+)[`\"']?",
-        r"(?:file|name)\s+(?:it\s+)?(?:called|named)\s+[`\"']?(\S+\.\w+)[`\"']?",
-        r"\*\*(\w[\w.-]*\.\w+)\*\*",
-        r"`(\w[\w.-]*\.\w+)`",
+        r"[Ss]ave (?:as|to|it as)\s+[`'\"]?(\w[\w.-]+\.\w+)",
+        r"[Ff]ile(?:name)?:\s*[`'\"]?(\w[\w.-]+\.\w+)",
+        r"[Cc]reate\s+[`'\"]?(\w[\w.-]+\.\w+)",
     ]
     for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
+        m = re.search(pat, text)
         if m:
-            fname = m.group(1).strip("`\"'")
-            if "." in fname and len(fname) < 60:
-                return fname
+            return m.group(1)
     return None
 
 
-def extract_timeout_hint(text: str) -> int | None:
-    """Extract predicted execution time from LLM response.
-
-    The LLM is prompted to include TIMEOUT: <seconds> when the script
-    needs longer than the default to run. Returns None if no hint found.
-    """
-    match = re.search(r"TIMEOUT:\s*(\d+)", text, re.IGNORECASE)
-    if match:
-        val = int(match.group(1))
-        # Clamp to reasonable range
-        return max(5, min(val, 600))
+def extract_timeout_hint(text: str) -> Optional[int]:
+    """Parse TIMEOUT: <seconds> from the top of an LLM response."""
+    m = re.search(r"TIMEOUT:\s*(\d+)", text[:300])
+    if m:
+        val = int(m.group(1))
+        if 5 <= val <= 600:
+            return val
     return None
 
 
 # ---------------------------------------------------------------------------
-# Block classification
+# Classification: script vs command
 # ---------------------------------------------------------------------------
 
-SCRIPT_LANGUAGES = {"python", "py", "c", "cpp", "c++", "rust", "java", "javascript", "js"}
+SCRIPT_LANGUAGES = {"python", "py", "c", "cpp", "c++", "rust", "java",
+                    "javascript", "js", "typescript", "ts", "go", "ruby"}
+
+CMD_STARTERS = re.compile(
+    r"^\s*(ps|kill|ls|cat|grep|find|i2cdetect|i2cget|i2cset|gpio|"
+    r"raspi-config|systemctl|journalctl|dmesg|lsusb|lsmod|modprobe|"
+    r"apt|pip|pip3|python3?|chmod|mkdir|cd|rm|cp|mv|echo|curl|wget|"
+    r"uname|hostname|uptime|free|df|top|htop|which|where|"
+    r"git|make|gcc|g\+\+)\b",
+    re.IGNORECASE,
+)
 
 JUNK_PATTERNS = [
-    r"python3?\s+\S+\.py\s*&",          # backgrounding tip
-    r"nohup\s+python",                    # nohup example
-    r"\bfg\b.*ctrl",                      # fg/Ctrl+C tip
-    r"^\$\s+",                            # terminal prompt ($ command)
-    r"^\d+\s+\d+\.\d+\s+\d+\.\d+",      # ps aux output
-    r"kill\s+(-\d+\s+)?(12345|<PID>)",   # placeholder PID
-    r"^sudo\s+(reboot|shutdown|halt)",    # dangerous
-]
-
-CMD_STARTERS = [
-    "ps ", "kill ", "pkill ", "killall ", "grep ", "ls ", "cat ", "cd ",
-    "mkdir ", "rm ", "mv ", "cp ", "chmod ", "systemctl ", "service ",
-    "df ", "du ", "free ", "pgrep ", "pidof ", "head ", "tail ", "find ",
-    "echo ", "wget ", "curl ", "apt ", "python3 ", "bash ", "test ",
-    "i2cdetect", "i2cget", "i2cset", "gpio", "can", "ip ", "ifconfig",
-    "ping ", "ss ", "netstat", "pip3 ", "pip ",
+    r"^\$\s",                   # $ prompt prefix
+    r"^(sudo\s+)?kill\s+\d+$",  # kill <specific PID>
+    r"^pip3?\s+install\b",      # pip install (handled separately)
 ]
 
 
 def classify_blocks(blocks: List[CodeBlock]) -> Tuple[List[CodeBlock], List[str]]:
-    """Split blocks into (scripts, commands).
+    """Classify code blocks into scripts (save+run) and commands (run directly).
 
-    scripts:  Multi-line code to save as a file, upload, and run.
-    commands: Short bash one-liners to execute directly via SSH.
+    Returns (scripts, commands).
     """
     scripts = []
     commands = []
@@ -293,39 +311,35 @@ def classify_blocks(blocks: List[CodeBlock]) -> Tuple[List[CodeBlock], List[str]
     for block in blocks:
         code = block.code.strip()
         lang = block.language.lower()
-        lines = [l for l in code.split("\n") if l.strip() and not l.strip().startswith("#")]
 
-        # Skip non-code blocks
+        # Skip non-code
         if lang in ("txt", "text", "plaintext", "yaml", "yml", "json", "xml"):
             continue
 
-        # Known programming languages -> script
-        if lang in SCRIPT_LANGUAGES and len(lines) >= 1:
+        # Known programming language -> script
+        if lang in SCRIPT_LANGUAGES and len(code.split("\n")) >= 1:
             scripts.append(block)
             continue
 
-        # Bash: script vs command
+        # Bash: multi-line or has logic -> script
         if lang in ("bash", "sh", "shell", ""):
-            # Multi-line with logic -> script
+            lines = [l for l in code.split("\n") if l.strip() and not l.strip().startswith("#")]
+
             if len(lines) >= 4 or any(kw in code for kw in
                     ["for ", "while ", "if ", "function ", "#!/"]):
                 scripts.append(block)
                 continue
 
-            # Check for junk
+            # Skip junk
             if any(re.search(p, code, re.IGNORECASE | re.MULTILINE) for p in JUNK_PATTERNS):
                 continue
 
-            # Short actionable commands -> extract individually
+            # Short commands
             for line in code.split("\n"):
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                # Strip leading $ prompt if present
-                if line.startswith("$ "):
-                    line = line[2:]
-                first = line.lower()
-                if any(first.startswith(s) for s in CMD_STARTERS):
+                if CMD_STARTERS.match(line):
                     commands.append(line)
 
     return scripts, commands
