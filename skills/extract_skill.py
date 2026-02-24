@@ -37,6 +37,14 @@ class CodeBlock:
         return ext_map.get(self.language, ".py")
 
 
+@dataclass
+class ExecutionContract:
+    """Execution expectations declared by the LLM for this response."""
+    estimated_seconds: Optional[int] = None
+    expects_output: Optional[bool] = None
+    infinite: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Regex for fenced code blocks
 # ---------------------------------------------------------------------------
@@ -449,6 +457,39 @@ def extract_timeout_hint(text: str) -> Optional[int]:
         if 5 <= val <= 600:
             return val
     return None
+
+
+def extract_execution_contract(text: str) -> ExecutionContract:
+    """Parse ESTIMATE/OUTPUT metadata from the top of an LLM response.
+
+    Expected format in first ~500 chars:
+      ESTIMATE: <40 seconds to complete>
+      OUTPUT: <should return an output>
+    """
+    top = text[:500]
+    contract = ExecutionContract()
+
+    estimate_match = re.search(r"ESTIMATE:\s*<?([^>\n]+)>?", top, re.IGNORECASE)
+    if estimate_match:
+        estimate_raw = estimate_match.group(1).strip().lower()
+        if any(tok in estimate_raw for tok in ("infinite", "forever", "no response")):
+            contract.infinite = True
+        else:
+            sec_match = re.search(r"(\d+)", estimate_raw)
+            if sec_match:
+                val = int(sec_match.group(1))
+                if 1 <= val <= 3600:
+                    contract.estimated_seconds = val
+
+    output_match = re.search(r"OUTPUT:\s*<?([^>\n]+)>?", top, re.IGNORECASE)
+    if output_match:
+        output_raw = output_match.group(1).strip().lower()
+        if any(tok in output_raw for tok in ("no output", "no response", "none", "silent")):
+            contract.expects_output = False
+        elif any(tok in output_raw for tok in ("should return", "should print", "output", "response")):
+            contract.expects_output = True
+
+    return contract
 
 
 # ---------------------------------------------------------------------------
