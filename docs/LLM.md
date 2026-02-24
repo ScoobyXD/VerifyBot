@@ -92,8 +92,16 @@ Each interaction with the LLM in a pipeline run is called a "Prompt" (Prompt 1, 
 ### Context injection at startup
 Before the first prompt, VerifyBot SSHs into the Pi and gathers: hostname, kernel, Python version, pip packages, working directory contents, disk/memory, running processes, I2C/GPIO/serial state. This is saved to `context/raspi.md` and injected into the initial prompt. On each new chat, the probe runs again and picks up any changes the previous session made.
 
+### LLM execution contract (estimate + output expectation)
+The first LLM response now includes an execution contract header so VerifyBot can set expectations before running code:
+- `ESTIMATE: <N seconds to complete>` for normal jobs, or
+- `ESTIMATE: <this will be infinite and have no response>` for intentional infinite/background behavior
+- `OUTPUT: <should return an output>` or `OUTPUT: <no output expected>`
+
+VerifyBot parses this contract and adjusts runtime handling (wait window and whether missing output should be treated as expected).
+
 ### LLM-predicted timeouts
-The LLM is prompted to include `TIMEOUT: <seconds>` when it knows a script needs longer than the default 30s. VerifyBot reads this and adjusts the execution timeout. This solves the false-negative problem where long-running scripts get killed prematurely.
+`TIMEOUT: <seconds>` is still supported as an explicit execution-time override when a script needs longer than the default 30s.
 
 ### No mode detection -- just execute what you get
 The old system had separate "terminal loop" and "file pipeline" modes with regex-based routing. v2 removes this: the LLM responds with scripts, bash commands, or both. VerifyBot extracts and executes whatever it gets, in order. No upfront mode decision needed.

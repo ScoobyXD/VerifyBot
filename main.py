@@ -39,7 +39,7 @@ from skills.chatgpt_skill import save_response, append_to_log
 from skills.ssh_skill import ssh_run, ssh_run_detached, sftp_upload, REMOTE_WORK_DIR
 from skills.extract_skill import (
     extract_blocks, extract_filename_hint, extract_timeout_hint,
-    classify_blocks, CodeBlock,
+    extract_execution_contract, classify_blocks, CodeBlock,
 )
 
 # ---------------------------------------------------------------------------
@@ -143,6 +143,10 @@ def build_initial_prompt(user_prompt: str, context: str, target: str,
         f"- Use whatever language, tools, or packages you think are best.\n"
         f"- If you need a package installed, include INSTALL: package1, package2 "
         f"at the top of your response.\n"
+        f"- Start your response with metadata lines exactly in this format:\n"
+        f"  ESTIMATE: <N seconds to complete> OR ESTIMATE: <this will be infinite and have no response>\n"
+        f"  OUTPUT: <should return an output> OR OUTPUT: <no output expected>\n"
+        f"- After metadata, provide code in fenced code blocks (```language ... ```).\n"
         f"- If this will take longer than 30 seconds to run, include "
         f"TIMEOUT: <seconds> at the top of your response.\n"
         f"- ASCII only in code output. No emojis.\n"
@@ -489,6 +493,23 @@ def save_output(name: str, stdout: str, stderr: str, attempt: int) -> Path:
     return filepath
 
 
+
+def _derive_run_expectations(default_timeout: int, contract) -> tuple[int, bool]:
+    """Convert LLM execution contract into runtime expectations."""
+    run_timeout = default_timeout
+    expect_output = True
+
+    if contract.infinite:
+        run_timeout = max(default_timeout, 120)
+        expect_output = False
+    else:
+        if contract.estimated_seconds is not None:
+            run_timeout = max(default_timeout, min(contract.estimated_seconds + 10, 1800))
+        if contract.expects_output is not None:
+            expect_output = contract.expects_output
+
+    return run_timeout, expect_output
+
 # ---------------------------------------------------------------------------
 # The pipeline
 # ---------------------------------------------------------------------------
@@ -569,10 +590,20 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             # Handle install requests
             handle_installs(response, resolved)
 
-            # Check for timeout hint from LLM
+            # Parse execution contract metadata from LLM
+            contract = extract_execution_contract(response)
+            run_timeout, expect_output = _derive_run_expectations(timeout, contract)
+            if contract.infinite:
+                print("  [CONTRACT] LLM indicates infinite/no-response behavior")
+            elif contract.estimated_seconds is not None:
+                print(f"  [CONTRACT] LLM estimates ~{contract.estimated_seconds}s")
+            if contract.expects_output is not None:
+                print(f"  [CONTRACT] Output expected: {contract.expects_output}")
+
+            # TIMEOUT hint still supported as an explicit override
             timeout_hint = extract_timeout_hint(response)
-            run_timeout = timeout_hint or timeout
             if timeout_hint:
+                run_timeout = timeout_hint
                 print(f"  [TIMEOUT] LLM says {timeout_hint}s needed")
 
             # Step 4: Extract code
@@ -677,6 +708,17 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                 print("\n  [WARN] Nothing executed.")
                 current_prompt = "None of the code was executable. Please provide a runnable script."
                 continue
+
+            if not expect_output:
+                append_to_log(
+                    md_path,
+                    f"Prompt {attempt} Execution Expectation",
+                    "LLM declared this run as no-output/infinite. Timeout/output absence treated as expected.",
+                )
+                for r in executed:
+                    if r.get("timed_out") and not (r.get("stdout") or r.get("stderr")):
+                        r["success"] = True
+                        r["expected_no_output"] = True
 
             # Log execution summary
             exec_log = ""
