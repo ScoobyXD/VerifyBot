@@ -32,6 +32,7 @@ class ChatGPTSession:
         self._ctx = None
         self._page = None
         self._in_conversation = False
+        self._last_response_complete = True
 
     def __enter__(self):
         self._pw = sync_playwright().start()
@@ -110,10 +111,11 @@ class ChatGPTSession:
             page.keyboard.press("Enter")
 
         time.sleep(S.POST_SEND_DELAY)
-        self._wait_for_response()
+        completed = self._wait_for_response()
 
         response = self._extract_last_response()
         self._in_conversation = True
+        self._last_response_complete = completed
         return response
 
     def _find_send_button(self):
@@ -126,6 +128,8 @@ class ChatGPTSession:
     def _wait_for_response(self, timeout=S.RESPONSE_TIMEOUT):
         print("[...] Waiting for response...")
         deadline = time.time() + timeout
+        last_text_len = 0
+        stable_count = 0
 
         while time.time() < deadline:
             still_streaming = False
@@ -141,6 +145,32 @@ class ChatGPTSession:
                     if indicator and indicator.is_visible():
                         print("[OK] Response complete.")
                         return True
+
+                # Neither streaming nor complete indicators visible.
+                # Check if content is still growing (ChatGPT may be
+                # between states -- the stop button disappeared but
+                # the regenerate button hasn't appeared yet).
+                current_len = 0
+                for sel in S.ASSISTANT_MESSAGE_SELECTORS:
+                    msgs = self._page.query_selector_all(sel)
+                    if msgs:
+                        try:
+                            current_len = len(msgs[-1].inner_text())
+                        except Exception:
+                            pass
+                        break
+
+                if current_len > 0 and current_len == last_text_len:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+                last_text_len = current_len
+
+                # Only consider it done if content has been stable for 5s
+                # AND we have some content
+                if stable_count >= 5 and current_len > 50:
+                    print("[OK] Response appears complete (content stable).")
+                    return True
 
             time.sleep(1)
 

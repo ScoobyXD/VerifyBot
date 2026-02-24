@@ -41,6 +41,6 @@ RESPONSE_COMPLETE_INDICATORS = [
 
 # --- Timeouts ---
 NAVIGATION_TIMEOUT = 30      # seconds to wait for page load
-RESPONSE_TIMEOUT = 120       # max wait for response streaming
+RESPONSE_TIMEOUT = 180       # max wait for response streaming
 TYPING_DELAY_MS = 30         # ms between keystrokes
 POST_SEND_DELAY = 2          # seconds after send before polling

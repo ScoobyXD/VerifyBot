@@ -81,7 +81,13 @@ VerifyBot does NOT try to diagnose errors, pick strategies, or add intelligence.
 After executing code, VerifyBot sends the full stdout/stderr back to ChatGPT and asks: "Does this correctly complete the task?" The LLM responds PASS, FAIL (with fix), or REVISE (with changes). This means even a program that exits 0 but produces wrong output gets caught. VerifyBot never decides success or failure — the LLM does.
 
 ### Versioned programs and outputs — never overwrite
-Every attempt saves files with `_1`, `_2`, `_3` suffixes. `programs/prime_gen_1.py` is attempt 1, `programs/prime_gen_2.py` is the fix. `outputs/prime_gen_1.txt` has the stdout/stderr from attempt 1. You always have full history to see what changed between versions.
+Every attempt saves files with `_1`, `_2`, `_3` suffixes. `programs/prime_gen_1.py` is attempt 1, `programs/prime_gen_2.py` is the fix. `outputs/prime_gen_1.txt` has the stdout/stderr from attempt 1. You always have full history to see what changed between versions. Duplicate scripts (identical code across prompts) are automatically detected and skipped.
+
+### Raw markdown logs include everything
+The `raw_md/` transcript files embed saved scripts and execution outputs inline in chronological order. Each pipeline run produces a single `.md` file that contains: the prompts sent, LLM responses, saved script contents (with language-fenced code), and execution outputs. This means you can read one file and see the entire conversation + code + results without jumping between directories.
+
+### Terminology: "Prompts" not "Attempts"
+Each interaction with the LLM in a pipeline run is called a "Prompt" (Prompt 1, Prompt 2, etc.) in all logs and output files. Prompt 1 is the initial request, subsequent prompts are verification/retry cycles.
 
 ### Context injection at startup
 Before the first prompt, VerifyBot SSHs into the Pi and gathers: hostname, kernel, Python version, pip packages, working directory contents, disk/memory, running processes, I2C/GPIO/serial state. This is saved to `context/raspi.md` and injected into the initial prompt. On each new chat, the probe runs again and picks up any changes the previous session made.
@@ -93,7 +99,7 @@ The LLM is prompted to include `TIMEOUT: <seconds>` when it knows a script needs
 The old system had separate "terminal loop" and "file pipeline" modes with regex-based routing. v2 removes this: the LLM responds with scripts, bash commands, or both. VerifyBot extracts and executes whatever it gets, in order. No upfront mode decision needed.
 
 ### Browser-based LLM, not API
-Uses Playwright to automate ChatGPT's browser UI. No API keys, no per-token costs. The LLM layer is a clean interface (core/session.py) that could be swapped for any browser-based LLM.
+Uses Playwright to automate ChatGPT's browser UI. No API keys, no per-token costs. The LLM layer is a clean interface (core/session.py) that could be swapped for any browser-based LLM. Response detection uses a stability check -- after the stop-generating button disappears, it waits for content to stabilize before extracting, preventing premature extraction of partial responses.
 
 ### Compilation happens on the target
 C/C++ files are uploaded to the Pi (or kept local) and compiled there. No cross-compilation complexity. The target machine has the right toolchain for itself.

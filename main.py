@@ -523,19 +523,22 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
 
     # Prepare logging
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    md_path = save_response(prompt, "(pipeline started)", attempt=0)
+    md_path = save_response(prompt, "(pipeline started)", prompt_num=0)
 
     with ChatGPTSession(headed=headed) as session:
         current_prompt = initial_prompt
         is_followup = False
 
+        # Track previously saved code to detect duplicates
+        _saved_code_hashes = set()
+
         for attempt in range(1, max_retries + 2):  # attempt 1 = first try
             print(f"\n{'='*60}")
-            print(f"[{'RETRY ' + str(attempt-1) if attempt > 1 else 'ATTEMPT 1'}]")
+            print(f"[{'RETRY ' + str(attempt-1) if attempt > 1 else 'PROMPT 1'}]")
             print(f"{'='*60}")
 
             # Log what we're sending to the LLM
-            append_to_log(md_path, f"Prompt Sent (Attempt {attempt})",
+            append_to_log(md_path, f"Prompt Sent (Prompt {attempt})",
                           f"```\n{current_prompt}\n```")
 
             # Step 3: Send to LLM
@@ -547,13 +550,19 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             is_followup = True
 
             # Log response
-            append_to_log(md_path, f"LLM Response (Attempt {attempt})", response)
+            append_to_log(md_path, f"LLM Response (Prompt {attempt})", response)
+
+            # If response was incomplete (timed out), warn and still try to use it
+            if hasattr(session, '_last_response_complete') and not session._last_response_complete:
+                print("  [WARN] Response may be incomplete (timed out while streaming).")
+                append_to_log(md_path, f"Prompt {attempt} Warning",
+                              "Response may be incomplete -- ChatGPT was still streaming when timeout hit.")
 
             # Check if the LLM just said PASS (from a verification followup)
             response_stripped = response.strip()
             if response_stripped.upper().startswith("PASS"):
                 print(f"\n[DONE] LLM verified: PASS")
-                append_to_log(md_path, f"Attempt {attempt} Result",
+                append_to_log(md_path, f"Prompt {attempt} Result",
                               "LLM VERIFIED: PASS")
                 break
 
@@ -571,7 +580,7 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             blocks = extract_blocks(response)
             if not blocks:
                 print("  [WARN] No code blocks found.")
-                append_to_log(md_path, f"Attempt {attempt}", "No code blocks found.")
+                append_to_log(md_path, f"Prompt {attempt}", "No code blocks found.")
                 current_prompt = (
                     "Your response contained no executable code. "
                     "Please provide a complete script in a fenced code block."
@@ -581,9 +590,21 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             scripts, commands = classify_blocks(blocks)
             print(f"  Found: {len(scripts)} script(s), {len(commands)} command(s)")
 
+            # Deduplicate scripts: skip if code identical to a previous prompt
+            if scripts:
+                unique_scripts = []
+                for block in scripts:
+                    code_hash = hash(block.code.strip())
+                    if code_hash in _saved_code_hashes:
+                        print(f"  [SKIP] Duplicate script detected (same code as previous prompt), skipping.")
+                    else:
+                        unique_scripts.append(block)
+                        _saved_code_hashes.add(code_hash)
+                scripts = unique_scripts
+
             if not scripts and not commands:
                 print("  [WARN] No executable code after classification.")
-                append_to_log(md_path, f"Attempt {attempt}",
+                append_to_log(md_path, f"Prompt {attempt}",
                               "Extracted blocks but none executable.")
                 current_prompt = (
                     "Your response contained code but none were executable "
@@ -622,9 +643,13 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                 saved_files = []
                 for i, block in enumerate(scripts):
                     fp = save_script(block, prompt, response, i, len(scripts), attempt)
-                    saved_files.append(fp)
+                    saved_files.append((fp, block))
 
-                for fp in saved_files:
+                for fp, block in saved_files:
+                    # Log the saved script into raw_md
+                    append_to_log(md_path, f"Saved Script: {fp.name} (Prompt {attempt})",
+                                  f"```{block.language}\n{block.code}\n```")
+
                     if resolved == "raspi":
                         result = run_script_on_pi(fp, remote_dir or REMOTE_WORK_DIR,
                                                   timeout=run_timeout, detach=detach)
@@ -635,23 +660,31 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             # Save outputs — versioned, never overwrite
             executed = [r for r in all_results if not r.get("skipped")]
             for r in executed:
-                save_output(r.get("name", "output"), r.get("stdout", ""),
-                            r.get("stderr", ""), attempt)
+                out_path = save_output(r.get("name", "output"), r.get("stdout", ""),
+                                       r.get("stderr", ""), attempt)
+                # Log the output file into raw_md
+                out_content = ""
+                if r.get("stdout"):
+                    out_content += f"STDOUT:\n```\n{r['stdout'][:3000]}\n```\n"
+                if r.get("stderr"):
+                    out_content += f"STDERR:\n```\n{r['stderr'][:2000]}\n```\n"
+                if not out_content:
+                    out_content = "(no output)\n"
+                append_to_log(md_path, f"Output: {out_path.name} (Prompt {attempt})",
+                              out_content)
 
             if not executed:
                 print("\n  [WARN] Nothing executed.")
                 current_prompt = "None of the code was executable. Please provide a runnable script."
                 continue
 
-            # Log execution
+            # Log execution summary
             exec_log = ""
             for r in executed:
                 exec_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
-                if r.get("stderr"):
-                    exec_log += f"stderr:\n```\n{r['stderr'][:2000]}\n```\n"
-                if r.get("stdout"):
-                    exec_log += f"stdout:\n```\n{r['stdout'][:2000]}\n```\n"
-            append_to_log(md_path, f"Attempt {attempt} Execution", exec_log)
+                if r.get("timed_out"):
+                    exec_log += f"(Timed out after {r.get('timeout', '?')}s)\n"
+            append_to_log(md_path, f"Prompt {attempt} Execution Summary", exec_log)
 
             # Step 6: Ask the LLM to verify — IT decides pass/fail
             if attempt > max_retries:

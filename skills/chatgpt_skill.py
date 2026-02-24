@@ -24,7 +24,7 @@ PROFILE_DIR = Path(__file__).resolve().parent.parent / ".browser_profile"
 RAW_MD_DIR = Path(__file__).resolve().parent.parent / "raw_md"
 
 
-def save_response(prompt: str, response: str, attempt: int = None) -> Path:
+def save_response(prompt: str, response: str, prompt_num: int = None) -> Path:
     """Save a prompt/response pair as timestamped markdown."""
     RAW_MD_DIR.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -32,7 +32,7 @@ def save_response(prompt: str, response: str, attempt: int = None) -> Path:
     filename = f"{ts}_{slug}.md"
     filepath = RAW_MD_DIR / filename
 
-    label = f" (Attempt {attempt})" if attempt else ""
+    label = f" (Prompt {prompt_num})" if prompt_num else ""
     content = (
         f"# LLM Response{label}\n"
         f"**Timestamp**: {datetime.now().isoformat()}\n"
