@@ -20,6 +20,7 @@ The LLM is the brain. This tool is just hands on the keyboard.
 """
 
 import argparse
+import ast
 import os
 import re
 import subprocess
@@ -510,6 +511,105 @@ def _derive_run_expectations(default_timeout: int, contract) -> tuple[int, bool]
 
     return run_timeout, expect_output
 
+
+def _safe_eval_number(node: ast.AST, constants: dict[str, float]) -> float | None:
+    """Evaluate a very small numeric expression subset used in script constants."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        val = _safe_eval_number(node.operand, constants)
+        if val is None:
+            return None
+        return val if isinstance(node.op, ast.UAdd) else -val
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+        left = _safe_eval_number(node.left, constants)
+        right = _safe_eval_number(node.right, constants)
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div) and right != 0:
+            return left / right
+    return None
+
+
+def _range_iterations(node: ast.For, constants: dict[str, float]) -> int | None:
+    """Estimate iteration count for simple range(...) loops."""
+    call = node.iter
+    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "range"):
+        return None
+
+    args = [_safe_eval_number(a, constants) for a in call.args]
+    if any(v is None for v in args) or not (1 <= len(args) <= 3):
+        return None
+
+    if len(args) == 1:
+        start, stop, step = 0.0, args[0], 1.0
+    elif len(args) == 2:
+        start, stop, step = args[0], args[1], 1.0
+    else:
+        start, stop, step = args[0], args[1], args[2]
+
+    if step == 0:
+        return None
+
+    try:
+        return len(range(int(start), int(stop), int(step)))
+    except Exception:
+        return None
+
+
+def infer_runtime_hint_from_python(code: str) -> int | None:
+    """Infer minimum runtime for simple `for ... range(...)` + `time.sleep(...)` loops."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+
+    constants: dict[str, float] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            val = _safe_eval_number(node.value, constants)
+            if val is not None:
+                constants[node.targets[0].id] = val
+
+    runtime = 0.0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.For):
+            continue
+        iterations = _range_iterations(node, constants)
+        if not iterations or iterations <= 0:
+            continue
+
+        sleep_total = 0.0
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call):
+                continue
+            is_sleep = (
+                isinstance(child.func, ast.Attribute)
+                and isinstance(child.func.value, ast.Name)
+                and child.func.value.id == "time"
+                and child.func.attr == "sleep"
+            ) or (isinstance(child.func, ast.Name) and child.func.id == "sleep")
+            if not is_sleep or not child.args:
+                continue
+            delay = _safe_eval_number(child.args[0], constants)
+            if delay is not None and delay > 0:
+                sleep_total += delay
+
+        if sleep_total > 0:
+            runtime += iterations * sleep_total
+
+    if runtime <= 0:
+        return None
+    return min(int(runtime + 10), 1800)
+
 # ---------------------------------------------------------------------------
 # The pipeline
 # ---------------------------------------------------------------------------
@@ -620,6 +720,20 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
 
             scripts, commands = classify_blocks(blocks)
             print(f"  Found: {len(scripts)} script(s), {len(commands)} command(s)")
+
+            # Guardrail: if Python code clearly implies a longer runtime than LLM ESTIMATE,
+            # bump timeout so we don't false-timeout long real-time loops.
+            inferred_candidates = [
+                infer_runtime_hint_from_python(b.code)
+                for b in scripts
+                if b.language.lower() in {"python", "py"}
+            ]
+            inferred_candidates = [v for v in inferred_candidates if v is not None]
+            if inferred_candidates:
+                inferred_timeout = max(inferred_candidates)
+                if inferred_timeout > run_timeout:
+                    run_timeout = inferred_timeout
+                    print(f"  [TIMEOUT] Static analysis suggests ~{inferred_timeout - 10}s runtime; using {inferred_timeout}s")
 
             # Deduplicate scripts: skip if code identical to a previous prompt
             if scripts:
