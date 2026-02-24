@@ -104,6 +104,14 @@ def _try_fenced(text: str) -> List[CodeBlock]:
         code = _strip_copy_code(code)
         code = code.strip()
 
+        # Clean: strip trailing prose and foreign-language blocks that
+        # leaked in due to imperfect fence reconstruction from inner_text().
+        # This happens when ChatGPT's response has a main code block followed
+        # by small bat/shell usage examples -- if the fences aren't
+        # reconstructed, the prose + examples get glued onto the code.
+        code = _strip_trailing_prose_from_code(code, lang)
+        code = code.strip()
+
         if code and code not in seen:
             seen.add(code)
             blocks.append(CodeBlock(language=lang, code=code, index=len(blocks)))
@@ -207,6 +215,172 @@ def _strip_copy_code(code: str) -> str:
     if code.startswith("Copy\n"):
         return code[len("Copy\n"):]
     return code
+
+
+def _strip_trailing_prose_from_code(code: str, lang: str) -> str:
+    """Strip trailing prose and foreign-language blocks from extracted code.
+
+    When session.py's _insert_fences fails to reconstruct small bat/shell
+    code blocks at the end of a ChatGPT response, they get glued onto the
+    main code block along with prose like "Run it from your folder:".
+
+    Strategy: find the last line that is a definitive code construct for the
+    language (like `if __name__` for Python, `return 0;` for C, etc.) and
+    cut everything after that logical block. If no definitive end is found,
+    fall back to walking backwards stripping prose.
+    """
+    if lang not in ("python", "py", "c", "cpp", "c++", "rust", "java",
+                     "javascript", "js", "typescript", "ts", "go", "ruby"):
+        return code
+
+    lines = code.split("\n")
+    if len(lines) < 3:
+        return code
+
+    # --- Strategy 1: Find the last definitive code boundary ---
+    # For Python: the `if __name__` block is always the end of a script.
+    # Find it, then include all indented lines after it, and cut the rest.
+    if lang in ("python", "py"):
+        cut_point = _find_python_code_end(lines)
+        if cut_point is not None and cut_point < len(lines):
+            trimmed = "\n".join(lines[:cut_point])
+            if trimmed.strip():
+                return trimmed
+
+    # --- Strategy 2: Walk backwards stripping non-code lines ---
+    code_end = len(lines)
+    i = len(lines) - 1
+    found_prose = False
+
+    while i >= 0:
+        stripped = lines[i].strip()
+
+        if not stripped:
+            i -= 1
+            continue
+
+        if stripped.lower() in KNOWN_LANG_LABELS or stripped.lower() in ("bat", "cmd", "powershell"):
+            code_end = i
+            i -= 1
+            found_prose = True
+            continue
+
+        if stripped.lower() in ("copy code", "copy"):
+            code_end = i
+            i -= 1
+            found_prose = True
+            continue
+
+        if _is_prose(stripped):
+            code_end = i
+            i -= 1
+            found_prose = True
+            continue
+
+        if _is_shell_command_line(stripped) and lang in ("python", "py", "c", "cpp",
+                                                          "c++", "rust", "java", "go"):
+            code_end = i
+            i -= 1
+            found_prose = True
+            continue
+
+        # If we've already found prose above and now hit a non-code short
+        # line (like "running" as example output), it's part of the prose block
+        if found_prose and len(stripped) < 60 and not _looks_like_code(stripped, lang):
+            code_end = i
+            i -= 1
+            continue
+
+        break
+
+    if code_end < len(lines):
+        while code_end > 0 and not lines[code_end - 1].strip():
+            code_end -= 1
+        return "\n".join(lines[:code_end])
+
+    return code
+
+
+def _find_python_code_end(lines: list) -> Optional[int]:
+    """Find where Python code logically ends.
+
+    Looks for `if __name__` guard and returns the line AFTER its block.
+    """
+    main_guard_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("if __name__"):
+            main_guard_idx = i
+
+    if main_guard_idx is None:
+        return None
+
+    # Walk forward from the guard, include all indented/blank lines
+    end = main_guard_idx + 1
+    while end < len(lines):
+        stripped = lines[end].strip()
+        if not stripped:
+            # Blank line — could be inside the block or after it
+            # Look ahead: if next non-blank line is indented, it's still in the block
+            peek = end + 1
+            while peek < len(lines) and not lines[peek].strip():
+                peek += 1
+            if peek < len(lines) and (lines[peek].startswith(" ") or lines[peek].startswith("\t")):
+                end = peek
+                continue
+            else:
+                # Blank line after the block — stop here
+                break
+        elif lines[end].startswith(" ") or lines[end].startswith("\t"):
+            # Indented — still in the if __name__ block
+            end += 1
+        else:
+            # Non-indented, non-blank — this is after the block
+            break
+
+    return end
+
+
+def _looks_like_code(line: str, lang: str) -> bool:
+    """Return True if line looks like it could be code in the given language."""
+    s = line.strip()
+    if not s:
+        return False
+
+    # Universal code indicators
+    code_chars = ("(", ")", "{", "}", "[", "]", "=", ";", "//", "/*", "*/",
+                  "->", "=>", "::", "&&", "||", "!=", "==", "<=", ">=")
+    if any(c in s for c in code_chars):
+        return True
+
+    # Python-specific
+    if lang in ("python", "py"):
+        py_markers = ("import ", "from ", "def ", "class ", "return ",
+                      "if ", "elif ", "else:", "for ", "while ", "with ",
+                      "try:", "except", "finally:", "raise ", "yield ",
+                      "print(", "self.", "assert ", "@", "#")
+        if any(s.startswith(m) for m in py_markers):
+            return True
+        # Indented lines are almost always code
+        if line.startswith(" ") or line.startswith("\t"):
+            return True
+
+    return False
+
+
+def _is_shell_command_line(line: str) -> bool:
+    """Return True if line looks like a shell command (not valid Python/C code)."""
+    s = line.strip()
+    # Common CLI invocation patterns
+    shell_starters = (
+        "python ", "python3 ", "pip ", "pip3 ",
+        "bash ", "sh ", "cmd ", "powershell ",
+        "gcc ", "g++ ", "make ", "cargo ",
+        "npm ", "node ", "ruby ", "go ",
+        "cd ", "ls ", "mkdir ", "rm ", "cp ", "mv ",
+        "cat ", "grep ", "curl ", "wget ",
+        "./", ".\\",
+    )
+    return any(s.startswith(p) for p in shell_starters)
 
 
 def _is_prose(line: str) -> bool:
