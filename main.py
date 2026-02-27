@@ -34,14 +34,6 @@ for _cache in Path(__file__).resolve().parent.rglob("__pycache__"):
         import shutil
         shutil.rmtree(_cache, ignore_errors=True)
 
-from core.session import ChatGPTSession
-from skills.chatgpt_skill import save_response, append_to_log
-from skills.ssh_skill import ssh_run, ssh_run_detached, sftp_upload, REMOTE_WORK_DIR
-from skills.extract_skill import (
-    extract_blocks, extract_filename_hint, extract_timeout_hint,
-    classify_blocks, CodeBlock,
-)
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -58,6 +50,8 @@ CONTEXT_DIR = ROOT / "context"
 
 def probe_pi(remote_dir: str = None) -> str:
     """SSH into Pi and gather live system context. Saved to context/raspi.md."""
+    from skills.ssh_skill import ssh_run, REMOTE_WORK_DIR
+
     rdir = remote_dir or REMOTE_WORK_DIR
     probes = [
         ("hostname",        "hostname"),
@@ -125,12 +119,61 @@ def _which(name):
 
 
 # ---------------------------------------------------------------------------
+# Direct local terminal commands (non-LLM)
+# ---------------------------------------------------------------------------
+
+_DIRECT_CMD_STARTERS = (
+    "git ", "ls", "cd ", "pwd", "cat ", "echo ", "touch ", "rm ", "mv ",
+    "cp ", "mkdir ", "python ", "python3 ", "pip ", "pip3 ", "npm ", "node ",
+    "yarn ", "pnpm ", "go ", "cargo ", "make", "bash ", "sh ", "chmod ",
+    "chown ", "find ", "rg ", "sed ", "awk ", "docker ", "kubectl ",
+)
+
+
+def _looks_like_direct_terminal_command(prompt: str) -> bool:
+    p = prompt.strip()
+    lower = p.lower()
+
+    if not p:
+        return False
+
+    if any(sym in p for sym in ("&&", "||", ";", "|", "\n")):
+        return True
+
+    return any(lower.startswith(s) for s in _DIRECT_CMD_STARTERS)
+
+
+def maybe_run_direct_terminal_command(prompt: str) -> bool:
+    """If prompt already looks like shell, run it directly and exit."""
+    if not _looks_like_direct_terminal_command(prompt):
+        return False
+
+    print("[DIRECT MODE] Running local terminal command exactly as provided.")
+    print(f"[COMMAND] {prompt}")
+
+    proc = subprocess.run(prompt, shell=True, cwd=str(ROOT), text=True,
+                          capture_output=True)
+
+    if proc.stdout:
+        print("\n[STDOUT]")
+        print(proc.stdout.rstrip())
+    if proc.stderr:
+        print("\n[STDERR]")
+        print(proc.stderr.rstrip())
+
+    print(f"\n[EXIT CODE] {proc.returncode}")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
 
 def build_initial_prompt(user_prompt: str, context: str, target: str,
                          remote_dir: str = None) -> str:
     """Build the first prompt with full system context."""
+    from skills.ssh_skill import REMOTE_WORK_DIR
+
     rdir = remote_dir or REMOTE_WORK_DIR
     target_desc = "Raspberry Pi 5 via SSH" if target == "raspi" else "this local machine"
 
@@ -217,6 +260,8 @@ def classify_target(prompt: str) -> str:
 
 def run_commands_on_pi(commands: list[str], timeout: int = 15) -> list[dict]:
     """Run bash commands on Pi via SSH."""
+    from skills.ssh_skill import ssh_run
+
     results = []
     for cmd in commands:
         print(f"  [SSH] {cmd}")
@@ -233,6 +278,8 @@ def run_commands_on_pi(commands: list[str], timeout: int = 15) -> list[dict]:
 def run_script_on_pi(filepath: Path, remote_dir: str, timeout: int = 30,
                      detach: bool = False) -> dict:
     """Upload and execute a script on Pi."""
+    from skills.ssh_skill import ssh_run, ssh_run_detached, sftp_upload, REMOTE_WORK_DIR
+
     rdir = remote_dir or REMOTE_WORK_DIR
     remote_path = f"{rdir}/{filepath.name}"
 
@@ -288,6 +335,8 @@ def run_script_on_pi(filepath: Path, remote_dir: str, timeout: int = 30,
 
 def _compile_and_run_on_pi(filepath: Path, rdir: str, timeout: int) -> dict:
     """Compile a C/C++ file on Pi, then run the binary."""
+    from skills.ssh_skill import ssh_run
+
     remote_path = f"{rdir}/{filepath.name}"
     ext = filepath.suffix.lower()
     compiler = "gcc" if ext == ".c" else "g++"
@@ -416,6 +465,7 @@ def handle_installs(response: str, target: str) -> bool:
 
     for pkg in packages:
         if target == "raspi":
+            from skills.ssh_skill import ssh_run
             print(f"  [INSTALL] pip3 install {pkg} on Pi...")
             r = ssh_run(f"pip3 install {pkg} --break-system-packages", timeout=120)
             ok = r["success"]
@@ -441,7 +491,7 @@ def make_slug(prompt: str) -> str:
     return "_".join(meaningful[:4]) or "program"
 
 
-def save_script(block: CodeBlock, prompt: str, response_text: str,
+def save_script(block, prompt: str, response_text: str,
                 index: int, total: int, attempt: int) -> Path:
     """Save a code block to programs/ with versioning.
 
@@ -451,6 +501,8 @@ def save_script(block: CodeBlock, prompt: str, response_text: str,
     PROGRAMS_DIR.mkdir(exist_ok=True)
 
     # Try to get a filename from the LLM response
+    from skills.extract_skill import extract_filename_hint
+
     fname_hint = extract_filename_hint(response_text)
     if fname_hint and Path(fname_hint).suffix == block.extension:
         base = Path(fname_hint).stem
@@ -497,6 +549,10 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                  timeout: int = 30, remote_dir: str = None,
                  headed: bool = True):
     """Main entry point. Prompt -> LLM -> execute -> verify -> retry."""
+    from core.session import ChatGPTSession
+    from skills.chatgpt_skill import save_response, append_to_log
+    from skills.ssh_skill import REMOTE_WORK_DIR
+    from skills.extract_skill import extract_blocks, extract_timeout_hint, classify_blocks
 
     # Resolve target
     resolved = target or classify_target(prompt)
@@ -734,6 +790,9 @@ def main():
     if args.login:
         from skills.chatgpt_skill import run_login_mode
         run_login_mode()
+        return
+
+    if maybe_run_direct_terminal_command(args.prompt):
         return
 
     run_pipeline(
