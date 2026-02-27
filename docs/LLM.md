@@ -67,8 +67,12 @@ skills/chatgpt_skill.py
 core/session.py
   └── core.selectors
 
+core/intents.py
+  (terminal intent classification + prompt rule snippets)
+
 skills/ssh_skill.py          (no internal imports, reads .env)
 skills/extract_skill.py      (no internal imports, pure regex)
+skills/terminal_skill.py     (terminal verification prompt helpers)
 core/selectors.py            (no imports, just constants)
 ```
 
@@ -107,6 +111,12 @@ C/C++ files are uploaded to the Pi (or kept local) and compiled there. No cross-
 ## Usage
 
 ```bash
+# Primary interface rule (IMPORTANT)
+# Use only this shape for day-to-day use:
+#   python main.py "<your request>"
+# Do NOT require users to run advanced dev-style commands,
+# inline Python snippets, or multi-command validation invocations.
+
 # First time: log in to ChatGPT manually
 python main.py --login
 
@@ -114,6 +124,10 @@ python main.py --login
 python main.py "make a random word generator for raspi"
 python main.py "write a fizzbuzz" --target local
 python main.py "kill the infinite counter script"
+
+# Terminal automation through the LLM loop
+python main.py "i want to rollback my recent commit to b202dc86e85a9c6ec79a330782abde01f87df73e"
+python main.py "check git status, then fetch origin and show me last 10 commits"
 
 # Debugging hardware
 python main.py "why is my I2C sensor not responding"
@@ -124,10 +138,22 @@ python main.py "stress test" --max-retries 5 --timeout 120
 python main.py "blink LED" --headless
 python main.py "read sensor" --remote-dir /home/scoobyxd/hw/pi
 
-# SSH skill standalone
-python -m skills.ssh_skill --test
-python -m skills.ssh_skill --run "ls -la ~/Documents"
 ```
+
+## Simplicity Rule for Commands
+
+For user-facing instructions and examples, default to exactly this format:
+
+```bash
+python main.py "<natural language request>"
+```
+
+Avoid asking the user to run advanced/dev-style commands such as:
+- heredocs (`python - <<'PY' ...`)
+- wildcard/glob compilation checks (`core/*.py`, `skills/*.py`)
+- ad-hoc inline validation scripts
+
+Those are acceptable for internal development/testing by maintainers, but they are not the expected everyday user experience.
 
 ## CLI Flags
 
@@ -140,6 +166,17 @@ python -m skills.ssh_skill --run "ls -la ~/Documents"
 | `--timeout N` | 30 | Default execution timeout (LLM can override with TIMEOUT: hint) |
 | `--remote-dir /path` | ~/Documents | Working directory on Pi |
 | `--login` | — | Open browser for manual ChatGPT login |
+## Terminal Tasks in the LLM Loop
+
+Terminal tasks (including git workflows like rollback/revert/reset/push) are handled through the same v2 architecture:
+
+1. You give one natural-language prompt.
+2. VerifyBot asks the LLM for executable commands/scripts.
+3. VerifyBot executes returned commands locally (or on Pi if target is raspi).
+4. VerifyBot sends raw command/script output back to the LLM for verification.
+5. The loop continues until `PASS` or retries are exhausted.
+
+For terminal-intent prompts, VerifyBot now adds extra instruction pressure in the initial prompt so the LLM returns command-first, executable bash blocks suitable for immediate execution.
 
 ## Dependencies
 

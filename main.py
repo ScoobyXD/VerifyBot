@@ -28,19 +28,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from core.intents import is_terminal_intent, terminal_prompt_rules
+from skills.terminal_skill import extract_simple_rollback_sha, build_terminal_verification_suffix
+
 # Clean stale bytecode on startup (prevents import issues after file updates)
 for _cache in Path(__file__).resolve().parent.rglob("__pycache__"):
     if _cache.is_dir():
         import shutil
         shutil.rmtree(_cache, ignore_errors=True)
-
-from core.session import ChatGPTSession
-from skills.chatgpt_skill import save_response, append_to_log
-from skills.ssh_skill import ssh_run, ssh_run_detached, sftp_upload, REMOTE_WORK_DIR
-from skills.extract_skill import (
-    extract_blocks, extract_filename_hint, extract_timeout_hint,
-    classify_blocks, CodeBlock,
-)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -58,6 +53,8 @@ CONTEXT_DIR = ROOT / "context"
 
 def probe_pi(remote_dir: str = None) -> str:
     """SSH into Pi and gather live system context. Saved to context/raspi.md."""
+    from skills.ssh_skill import ssh_run, REMOTE_WORK_DIR
+
     rdir = remote_dir or REMOTE_WORK_DIR
     probes = [
         ("hostname",        "hostname"),
@@ -124,6 +121,48 @@ def _which(name):
     return shutil.which(name)
 
 
+def maybe_run_simple_rollback(prompt: str) -> bool:
+    """Run rollback/reset to a SHA directly from one natural-language prompt."""
+    sha = extract_simple_rollback_sha(prompt)
+    if not sha:
+        return False
+
+    print("[ROLLBACK MODE] Detected rollback intent with commit SHA.")
+    cmds = [
+        "git rev-parse --abbrev-ref HEAD",
+        "git fetch origin",
+        f"git reset --hard {sha}",
+    ]
+
+    branch = None
+    for cmd in cmds:
+        print(f"  [RUN] {cmd}")
+        proc = subprocess.run(cmd, shell=True, cwd=str(ROOT), text=True, capture_output=True)
+        if proc.stdout.strip():
+            print(proc.stdout.strip())
+        if proc.stderr.strip():
+            print(proc.stderr.strip())
+        if proc.returncode != 0:
+            print(f"[FAIL] Command failed with exit code {proc.returncode}: {cmd}")
+            return True
+        if cmd == "git rev-parse --abbrev-ref HEAD":
+            branch = proc.stdout.strip()
+
+    push_cmd = f"git push origin {branch or 'main'} --force-with-lease"
+    print(f"  [RUN] {push_cmd}")
+    proc = subprocess.run(push_cmd, shell=True, cwd=str(ROOT), text=True, capture_output=True)
+    if proc.stdout.strip():
+        print(proc.stdout.strip())
+    if proc.stderr.strip():
+        print(proc.stderr.strip())
+    if proc.returncode != 0:
+        print(f"[FAIL] Push failed with exit code {proc.returncode}")
+        return True
+
+    print("[DONE] Local + GitHub rollback completed.")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
@@ -131,8 +170,16 @@ def _which(name):
 def build_initial_prompt(user_prompt: str, context: str, target: str,
                          remote_dir: str = None) -> str:
     """Build the first prompt with full system context."""
+    from skills.ssh_skill import REMOTE_WORK_DIR
+
     rdir = remote_dir or REMOTE_WORK_DIR
     target_desc = "Raspberry Pi 5 via SSH" if target == "raspi" else "this local machine"
+
+    terminal_mode = is_terminal_intent(user_prompt)
+
+    terminal_rules = ""
+    if terminal_mode:
+        terminal_rules = terminal_prompt_rules()
 
     return (
         f"You are helping me debug and write code for hardware.\n"
@@ -145,6 +192,7 @@ def build_initial_prompt(user_prompt: str, context: str, target: str,
         f"at the top of your response.\n"
         f"- If this will take longer than 30 seconds to run, include "
         f"TIMEOUT: <seconds> at the top of your response.\n"
+        f"{terminal_rules}"
         f"- ASCII only in code output. No emojis.\n"
         f"- Print clear status messages so I can see what happened.\n\n"
         f"TASK: {user_prompt}\n"
@@ -178,8 +226,7 @@ def build_verification_prompt(executed: list[dict], original_task: str) -> str:
         "Based on the output above, does this correctly complete the task?\n"
         "Respond with exactly one of:\n"
         "- PASS: if the task is complete and the output is correct\n"
-        "- FAIL: if there are errors, and then provide the complete fixed code\n"
-        "- REVISE: if it partially works but needs changes, and then provide the complete revised code"
+        f"{build_terminal_verification_suffix()}"
     )
 
     return "\n".join(lines)
@@ -217,6 +264,8 @@ def classify_target(prompt: str) -> str:
 
 def run_commands_on_pi(commands: list[str], timeout: int = 15) -> list[dict]:
     """Run bash commands on Pi via SSH."""
+    from skills.ssh_skill import ssh_run
+
     results = []
     for cmd in commands:
         print(f"  [SSH] {cmd}")
@@ -233,6 +282,8 @@ def run_commands_on_pi(commands: list[str], timeout: int = 15) -> list[dict]:
 def run_script_on_pi(filepath: Path, remote_dir: str, timeout: int = 30,
                      detach: bool = False) -> dict:
     """Upload and execute a script on Pi."""
+    from skills.ssh_skill import ssh_run, ssh_run_detached, sftp_upload, REMOTE_WORK_DIR
+
     rdir = remote_dir or REMOTE_WORK_DIR
     remote_path = f"{rdir}/{filepath.name}"
 
@@ -288,6 +339,8 @@ def run_script_on_pi(filepath: Path, remote_dir: str, timeout: int = 30,
 
 def _compile_and_run_on_pi(filepath: Path, rdir: str, timeout: int) -> dict:
     """Compile a C/C++ file on Pi, then run the binary."""
+    from skills.ssh_skill import ssh_run
+
     remote_path = f"{rdir}/{filepath.name}"
     ext = filepath.suffix.lower()
     compiler = "gcc" if ext == ".c" else "g++"
@@ -416,6 +469,7 @@ def handle_installs(response: str, target: str) -> bool:
 
     for pkg in packages:
         if target == "raspi":
+            from skills.ssh_skill import ssh_run
             print(f"  [INSTALL] pip3 install {pkg} on Pi...")
             r = ssh_run(f"pip3 install {pkg} --break-system-packages", timeout=120)
             ok = r["success"]
@@ -441,7 +495,7 @@ def make_slug(prompt: str) -> str:
     return "_".join(meaningful[:4]) or "program"
 
 
-def save_script(block: CodeBlock, prompt: str, response_text: str,
+def save_script(block, prompt: str, response_text: str,
                 index: int, total: int, attempt: int) -> Path:
     """Save a code block to programs/ with versioning.
 
@@ -451,6 +505,8 @@ def save_script(block: CodeBlock, prompt: str, response_text: str,
     PROGRAMS_DIR.mkdir(exist_ok=True)
 
     # Try to get a filename from the LLM response
+    from skills.extract_skill import extract_filename_hint
+
     fname_hint = extract_filename_hint(response_text)
     if fname_hint and Path(fname_hint).suffix == block.extension:
         base = Path(fname_hint).stem
@@ -497,6 +553,10 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                  timeout: int = 30, remote_dir: str = None,
                  headed: bool = True):
     """Main entry point. Prompt -> LLM -> execute -> verify -> retry."""
+    from core.session import ChatGPTSession
+    from skills.chatgpt_skill import save_response, append_to_log
+    from skills.ssh_skill import REMOTE_WORK_DIR
+    from skills.extract_skill import extract_blocks, extract_timeout_hint, classify_blocks
 
     # Resolve target
     resolved = target or classify_target(prompt)
@@ -734,6 +794,9 @@ def main():
     if args.login:
         from skills.chatgpt_skill import run_login_mode
         run_login_mode()
+        return
+
+    if maybe_run_simple_rollback(args.prompt):
         return
 
     run_pipeline(
