@@ -164,6 +164,53 @@ def maybe_run_simple_rollback(prompt: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Direct local terminal commands (non-LLM)
+# ---------------------------------------------------------------------------
+
+_DIRECT_CMD_STARTERS = (
+    "git ", "ls", "cd ", "pwd", "cat ", "echo ", "touch ", "rm ", "mv ",
+    "cp ", "mkdir ", "python ", "python3 ", "pip ", "pip3 ", "npm ", "node ",
+    "yarn ", "pnpm ", "go ", "cargo ", "make", "bash ", "sh ", "chmod ",
+    "chown ", "find ", "rg ", "sed ", "awk ", "docker ", "kubectl ",
+)
+
+
+def _looks_like_direct_terminal_command(prompt: str) -> bool:
+    p = prompt.strip()
+    lower = p.lower()
+
+    if not p:
+        return False
+
+    if any(sym in p for sym in ("&&", "||", ";", "|", "\n")):
+        return True
+
+    return any(lower.startswith(s) for s in _DIRECT_CMD_STARTERS)
+
+
+def maybe_run_direct_terminal_command(prompt: str) -> bool:
+    """If prompt already looks like shell, run it directly and exit."""
+    if not _looks_like_direct_terminal_command(prompt):
+        return False
+
+    print("[DIRECT MODE] Running local terminal command exactly as provided.")
+    print(f"[COMMAND] {prompt}")
+
+    proc = subprocess.run(prompt, shell=True, cwd=str(ROOT), text=True,
+                          capture_output=True)
+
+    if proc.stdout:
+        print("\n[STDOUT]")
+        print(proc.stdout.rstrip())
+    if proc.stderr:
+        print("\n[STDERR]")
+        print(proc.stderr.rstrip())
+
+    print(f"\n[EXIT CODE] {proc.returncode}")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
 
