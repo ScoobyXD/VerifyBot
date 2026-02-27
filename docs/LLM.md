@@ -115,6 +115,11 @@ python main.py "make a random word generator for raspi"
 python main.py "write a fizzbuzz" --target local
 python main.py "kill the infinite counter script"
 
+# Direct terminal command mode (runs exactly what you type)
+python main.py "git status"
+python main.py "git checkout main && git pull"
+python main.py "git reset --hard 1df3315 && git push origin main --force-with-lease"
+
 # Debugging hardware
 python main.py "why is my I2C sensor not responding"
 python main.py "set up CAN bus between Pi and STM32"
@@ -140,6 +145,23 @@ python -m skills.ssh_skill --run "ls -la ~/Documents"
 | `--timeout N` | 30 | Default execution timeout (LLM can override with TIMEOUT: hint) |
 | `--remote-dir /path` | ~/Documents | Working directory on Pi |
 | `--login` | — | Open browser for manual ChatGPT login |
+## Direct Terminal Command Mode
+
+If your prompt already looks like a terminal command (for example starts with `git`, `ls`, `python`, `npm`, includes `&&`, `;`, pipes, etc.), VerifyBot runs that command directly on your local machine from the repo root instead of opening the browser/LLM pipeline.
+
+Examples:
+
+```bash
+python main.py "git log --oneline -5"
+python main.py "git fetch origin && git checkout main && git pull"
+python main.py "git reset --hard 1df3315 && git push origin main --force-with-lease"
+```
+
+This gives you a simple single-entry command style:
+
+```bash
+python main.py "<any terminal command(s)>"
+```
 
 ## Dependencies
 
