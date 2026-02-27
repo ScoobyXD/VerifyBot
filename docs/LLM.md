@@ -90,13 +90,19 @@ The `raw_md/` transcript files embed saved scripts and execution outputs inline 
 Each interaction with the LLM in a pipeline run is called a "Prompt" (Prompt 1, Prompt 2, etc.) in all logs and output files. Prompt 1 is the initial request, subsequent prompts are verification/retry cycles.
 
 ### Context injection at startup
-Before the first prompt, VerifyBot SSHs into the Pi and gathers: hostname, kernel, Python version, pip packages, working directory contents, disk/memory, running processes, I2C/GPIO/serial state. This is saved to `context/raspi.md` and injected into the initial prompt. On each new chat, the probe runs again and picks up any changes the previous session made.
+Before the first prompt, VerifyBot SSHs into the Pi and gathers: hostname, kernel, Python version, pip packages, working directory contents, disk/memory, running processes, I2C/GPIO/serial state. This is saved to `context/raspi.md` and injected into the initial prompt. On each new chat, the probe runs again and picks up any changes the previous session made. For local targets, context includes the git branch, bash availability, and installed compilers.
+
+### Prompt engineering for reliable extraction
+The initial prompt tells the LLM to put ALL code in exactly ONE fenced code block, and to put NO text after the closing fence. This prevents ChatGPT's usage instructions ("Save as...", "How to run...") from leaking into the extracted code. The prompt also stresses simplicity: fewer lines = fewer bugs.
 
 ### LLM-predicted timeouts
 The LLM is prompted to include `TIMEOUT: <seconds>` when it knows a script needs longer than the default 30s. VerifyBot reads this and adjusts the execution timeout. This solves the false-negative problem where long-running scripts get killed prematurely.
 
 ### No mode detection -- just execute what you get
 The old system had separate "terminal loop" and "file pipeline" modes with regex-based routing. v2 removes this: the LLM responds with scripts, bash commands, or both. VerifyBot extracts and executes whatever it gets, in order. No upfront mode decision needed.
+
+### Local target = Python only
+When target is `local`, the LLM is told to ALWAYS write Python. Even for simple tasks like creating folders, running git commands, or moving files -- the LLM uses `subprocess.run()`, `os`, `shutil`, and `pathlib` instead of bash. This eliminates all bash-on-Windows problems (WSL path mangling, Git Bash detection, cmd.exe incompatibilities). If the LLM writes a `.sh` script anyway, `run_script_local` returns a clear error telling it to rewrite in Python. The Raspberry Pi target still supports bash, Python, and C/C++ since it's native Linux over SSH.
 
 ### Browser-based LLM, not API
 Uses Playwright to automate ChatGPT's browser UI. No API keys, no per-token costs. The LLM layer is a clean interface (core/session.py) that could be swapped for any browser-based LLM. Response detection uses a stability check -- after the stop-generating button disappears, it waits for content to stabilize before extracting, preventing premature extraction of partial responses.

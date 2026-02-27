@@ -59,16 +59,42 @@ KNOWN_LANG_LABELS = {
 
 # Lines that definitely start code (anchors)
 CODE_START_MARKERS = (
+    # Universal
     "#!/",
+    # Python
     "import ",
     "from ",
     "def ",
     "class ",
+    # C/C++
     "#include",
     "int main",
+    # Rust
     "fn ",
+    # Java/Go
     "package ",
+    # C#
     "using ",
+    # Bash / shell commands
+    "echo ",
+    "mkdir ",
+    "cd ",
+    "set ",
+    "export ",
+    "chmod ",
+    "cat ",
+    "cp ",
+    "mv ",
+    "rm ",
+    "touch ",
+    "git ",
+    "sudo ",
+    "apt ",
+    "pip ",
+    "pip3 ",
+    "python3 ",
+    "curl ",
+    "wget ",
 )
 
 
@@ -230,7 +256,8 @@ def _strip_trailing_prose_from_code(code: str, lang: str) -> str:
     fall back to walking backwards stripping prose.
     """
     if lang not in ("python", "py", "c", "cpp", "c++", "rust", "java",
-                     "javascript", "js", "typescript", "ts", "go", "ruby"):
+                     "javascript", "js", "typescript", "ts", "go", "ruby",
+                     "bash", "sh", "shell"):
         return code
 
     lines = code.split("\n")
@@ -364,6 +391,19 @@ def _looks_like_code(line: str, lang: str) -> bool:
         if line.startswith(" ") or line.startswith("\t"):
             return True
 
+    # Bash-specific
+    if lang in ("bash", "sh", "shell"):
+        bash_markers = ("echo ", "mkdir ", "cd ", "chmod ", "export ",
+                        "source ", "if ", "then", "fi", "else", "elif ",
+                        "for ", "do", "done", "while ", "case ", "esac",
+                        "function ", "local ", "readonly ", "set ",
+                        "trap ", "exit ", "return ", "#!", "#")
+        if any(s.startswith(m) for m in bash_markers):
+            return True
+        # Variable assignments: FOO=bar or foo="bar"
+        if "=" in s and not s.startswith(("Here", "This", "The", "It")):
+            return True
+
     return False
 
 
@@ -396,6 +436,8 @@ def _is_prose(line: str) -> bool:
         "To ", "Let ", "We ", "For ", "In ", "That ", "These ",
         "Make sure", "Please ", "Copy ", "Output", "Example",
         "Explanation", "How ", "What ", "When ", "Where ",
+        "Do ", "Do NOT", "Don't ", "Correct ", "Below ", "Above ",
+        "Step ", "Steps", "Expected ", "Should ", "Will ",
     )
     if any(s.startswith(p) for p in prose_starters):
         return True
@@ -413,13 +455,42 @@ def _is_prose(line: str) -> bool:
 
 
 def _guess_language(code: str) -> str:
-    """Guess language from code content."""
+    """Guess language from code content (unfenced fallback only).
+
+    Note: This is only called when there are NO fenced code blocks.
+    When fences exist, the language comes from the fence label which
+    session.py extracts from ChatGPT's DOM header (e.g. "Bash", "Python").
+    """
+    # Check for bash/shell patterns first -- ChatGPT writes bash without
+    # shebangs most of the time (just starts with echo, set, mkdir, etc.)
+    bash_starters = ("echo ", "set ", "mkdir ", "cd ", "chmod ", "export ",
+                     "source ", "apt ", "apt-get ", "sudo ", "grep ", "cat ",
+                     "rm ", "cp ", "mv ", "ls ", "find ", "sed ", "awk ",
+                     "git ", "curl ", "wget ", "tar ", "unzip ", "kill ",
+                     "#!/")
+    first_real = ""
+    for line in code.split("\n"):
+        s = line.strip()
+        if s and not s.startswith("#"):
+            first_real = s
+            break
+
+    if any(code.strip().startswith(m) or first_real.startswith(m)
+           for m in bash_starters):
+        # Make sure it's not Python that happens to use subprocess
+        if "import " not in code and "def " not in code and "print(" not in code:
+            return "bash"
+
     if "def " in code or "import " in code or "print(" in code:
         return "python"
     if "#include" in code or "int main" in code:
         return "c"
-    if code.startswith("#!/bin/bash") or code.startswith("#!/bin/sh"):
-        return "bash"
+    if code.strip().startswith("#!/"):
+        if "bash" in code.split("\n")[0] or "sh" in code.split("\n")[0]:
+            return "bash"
+        if "python" in code.split("\n")[0]:
+            return "python"
+
     return "python"
 
 

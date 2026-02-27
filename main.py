@@ -11,7 +11,7 @@ One command does everything:
 The loop:
     1. Probe target machine (Pi or local) for system context
     2. Build context-rich prompt, send to ChatGPT via browser
-    3. Extract code blocks / bash commands from response
+    3. Extract code blocks from response
     4. Deploy and execute on target
     5. If failed: feed raw output back to ChatGPT, retry
     6. Log everything to raw_md/
@@ -106,10 +106,17 @@ def probe_local() -> str:
         f"- Python: {platform.python_version()}",
         f"- CWD: {os.getcwd()}",
     ]
+
+    # Git branch
+    git_branch = _get_git_branch()
+    if git_branch:
+        lines.append(f"- Git branch: {git_branch}")
+
     # Check for compilers
     for tool in ["gcc", "g++", "arm-none-eabi-gcc"]:
         found = "yes" if _which(tool) else "no"
         lines.append(f"- {tool}: {found}")
+
     content = "\n".join(lines)
 
     CONTEXT_DIR.mkdir(exist_ok=True)
@@ -124,29 +131,64 @@ def _which(name):
     return shutil.which(name)
 
 
+def _get_git_branch() -> str:
+    """Get current git branch name, or empty string if not a git repo."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
 
 def build_initial_prompt(user_prompt: str, context: str, target: str,
                          remote_dir: str = None) -> str:
-    """Build the first prompt with full system context."""
+    """Build the first prompt with full system context as a single dense blob."""
     rdir = remote_dir or REMOTE_WORK_DIR
     target_desc = "Raspberry Pi 5 via SSH" if target == "raspi" else "this local machine"
 
+    # Build context as a compact single line
+    ctx_compact = context.replace("# ", "").replace("_Probed:", "*Probed:").replace("\n- ", " - ")
+    ctx_compact = " ".join(ctx_compact.split())
+
+    # Execution environment differs by target
+    if target == "raspi":
+        exec_note = (
+            "EXECUTION ENVIRONMENT: My runner uploads your code to the Pi and executes it via SSH. "
+            "Supported: Python (.py), Bash (.sh), C/C++ (.c/.cpp, compiled on Pi). "
+        )
+    else:
+        exec_note = (
+            "EXECUTION ENVIRONMENT: My runner saves your code to a .py file and executes it with Python. "
+            "ALWAYS write Python, even for simple tasks like creating folders, moving files, or running git commands. "
+            "Use subprocess.run() for any system/git/shell commands. "
+            "Use os, shutil, pathlib for file operations. "
+            "NEVER write bash/shell scripts for local execution -- only Python works here. "
+        )
+
     return (
-        f"You are helping me debug and write code for hardware.\n"
-        f"Code will be deployed and executed on: {target_desc}\n\n"
-        f"{context}\n\n"
-        f"RULES:\n"
-        f"- Put all code inside fenced code blocks (```language ... ```).\n"
-        f"- Use whatever language, tools, or packages you think are best.\n"
-        f"- If you need a package installed, include INSTALL: package1, package2 "
-        f"at the top of your response.\n"
-        f"- If this will take longer than 30 seconds to run, include "
-        f"TIMEOUT: <seconds> at the top of your response.\n"
-        f"- ASCII only in code output. No emojis.\n"
-        f"- Print clear status messages so I can see what happened.\n\n"
+        f"You are helping me debug and write code for hardware. "
+        f"Code will be deployed and executed on: {target_desc}. "
+        f"{ctx_compact} "
+        f"{exec_note}"
+        f"RULES: SIMPLICITY FIRST: prefer the simplest, most direct solution. "
+        f"Avoid over-engineering. Fewer lines = fewer bugs. "
+        f"Put ALL code inside exactly ONE fenced code block (```language\\n...code...\\n```). "
+        f"Do NOT put any text after the closing of your code block. "
+        f"No usage instructions, no \"how to run\", no \"save as\". "
+        f"If you need multiple files or steps, put them ALL in one script that handles everything. "
+        f"If you need a package installed, include INSTALL: package1, package2 at the top of your response. "
+        f"If this will take longer than 30 seconds to run, include TIMEOUT: <seconds> at the top of your response. "
+        f"ASCII only in code output. No emojis. "
+        f"Print clear status messages so I can see what happened.\n\n"
         f"TASK: {user_prompt}\n"
     )
 
@@ -212,7 +254,7 @@ def classify_target(prompt: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Execution
+# Execution -- Raspberry Pi (SSH, supports bash + python + C/C++)
 # ---------------------------------------------------------------------------
 
 def run_commands_on_pi(commands: list[str], timeout: int = 15) -> list[dict]:
@@ -250,7 +292,6 @@ def run_script_on_pi(filepath: Path, remote_dir: str, timeout: int = 30,
     elif ext == ".sh":
         executor = "bash"
     elif ext in (".c", ".cpp"):
-        # Compile on Pi, then run
         return _compile_and_run_on_pi(filepath, rdir, timeout)
     else:
         print(f"  [SKIP] {filepath.name} (uploaded only, not directly runnable)")
@@ -308,19 +349,27 @@ def _compile_and_run_on_pi(filepath: Path, rdir: str, timeout: int) -> dict:
             "timed_out": r.get("timed_out", False), "timeout": timeout}
 
 
+# ---------------------------------------------------------------------------
+# Execution -- Local (Python only, plus C/C++ compilation)
+# ---------------------------------------------------------------------------
+
 def run_script_local(filepath: Path, timeout: int = 30) -> dict:
-    """Run a script locally."""
+    """Run a script locally. Only Python and C/C++ are supported."""
     ext = filepath.suffix.lower()
 
     if ext == ".py":
         cmd = [sys.executable, str(filepath)]
-    elif ext == ".sh":
-        cmd = ["bash", str(filepath)]
     elif ext in (".c", ".cpp"):
         return _compile_and_run_local(filepath, timeout)
     else:
-        return {"name": filepath.name, "success": True, "exit_code": 0,
-                "stdout": "", "stderr": "", "timed_out": False, "skipped": True}
+        # Local target only runs Python. If the LLM wrote bash, tell it.
+        return {"name": filepath.name, "success": False, "exit_code": -1,
+                "stdout": "",
+                "stderr": (f"[ERROR] Cannot execute {ext} locally. "
+                           f"Local target only supports Python (.py) and C/C++. "
+                           f"Please rewrite as a Python script using subprocess.run() "
+                           f"for any shell commands."),
+                "timed_out": False}
 
     print(f"  [RUN] {' '.join(cmd)}")
     try:
@@ -362,6 +411,10 @@ def _compile_and_run_local(filepath: Path, timeout: int) -> dict:
                 "stdout": e.stdout or "", "stderr": e.stderr or "",
                 "timed_out": True, "timeout": timeout}
 
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
 
 def _print_output(r: dict):
     """Print SSH result output."""
@@ -616,27 +669,13 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             print(f"\n[4] Executing on {resolved}...")
             all_results = []
 
-            # Commands
+            # Commands (raspi only -- local uses Python for everything)
             if commands:
                 if resolved == "raspi":
                     cmd_results = run_commands_on_pi(commands, timeout=15)
+                    all_results.extend(cmd_results)
                 else:
-                    cmd_results = []
-                    for cmd in commands:
-                        print(f"  [LOCAL] {cmd}")
-                        try:
-                            proc = subprocess.run(cmd, shell=True, capture_output=True,
-                                                  text=True, timeout=15)
-                            r = {"cmd": cmd, "name": cmd[:60], "success": proc.returncode == 0,
-                                 "exit_code": proc.returncode, "stdout": proc.stdout,
-                                 "stderr": proc.stderr, "timed_out": False}
-                        except subprocess.TimeoutExpired:
-                            r = {"cmd": cmd, "name": cmd[:60], "success": False,
-                                 "exit_code": -1, "stdout": "", "stderr": "Timed out",
-                                 "timed_out": True}
-                        _print_output_local(r)
-                        cmd_results.append(r)
-                all_results.extend(cmd_results)
+                    print(f"  [SKIP] {len(commands)} shell command(s) -- local runs Python only")
 
             # Scripts — versioned, never overwrite
             if scripts:
@@ -675,7 +714,7 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
 
             if not executed:
                 print("\n  [WARN] Nothing executed.")
-                current_prompt = "None of the code was executable. Please provide a runnable script."
+                current_prompt = "None of the code was executable. Please provide a runnable Python script."
                 continue
 
             # Log execution summary
