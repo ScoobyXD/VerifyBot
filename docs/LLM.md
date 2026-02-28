@@ -85,6 +85,7 @@ verifybot/
 │   ├── selectors.py           # ChatGPT DOM selectors (update when frontend changes)
 │   ├── session.py             # Persistent browser session (prompt, followup, new_chat)
 │   ├── setup.py               # First-time setup wizard (runs once automatically)
+│   ├── artifact_sweep.py      # Post-execution cleanup (moves output files to outputs/)
 │   └── .setup_complete        # Marker file -- exists after first-time setup (gitignored)
 ├── skills/
 │   ├── __init__.py            # Package marker
@@ -117,6 +118,7 @@ verifybot/
 main.py
   ├── core.setup            (is_first_run, run_setup)  -- checked before other imports
   ├── core.session          (ChatGPTSession)
+  ├── core.artifact_sweep   (snapshot_dirs, sweep_artifacts)
   ├── skills.chatgpt_skill  (save_response, append_to_log)
   ├── skills.ssh_skill      (ssh_run, ssh_run_live, ssh_run_detached, sftp_upload)
   └── skills.extract_skill  (extract_blocks, classify_blocks, extract_timeout_hint)
@@ -129,6 +131,7 @@ core/session.py
   └── core.selectors
 
 core/setup.py                (no internal imports, stdlib only)
+core/artifact_sweep.py       (no internal imports, stdlib only)
 skills/ssh_skill.py          (no internal imports, reads .env)
 skills/extract_skill.py      (no internal imports, pure regex)
 core/selectors.py            (no imports, just constants)
@@ -259,3 +262,4 @@ playwright install chromium
 16. **test.md.** Every test run produces `raw_md/test.md` containing the complete record of every test: status, stream, target, prompt, elapsed time, and any errors. After all streams finish, the file gets a summary table and an LLM assertion section where ChatGPT reviews the results and gives a final verdict. Both the summary table and console output sort results by test number for consistency.
 17. **LLM assertion.** After all tests complete, `raw_md/test.md` is fed to a fresh ChatGPT session that reviews every result and produces a VERDICT. This closes the loop: the LLM runs the code AND judges the test suite. The verdict is appended to test.md and printed to the console. Error messages in test.md are truncated to the first line to keep the record clean.
 18. **Stream assignment.** When adding new tests, set `"stream": "X"` where X is a unique letter for independent tests, or reuse an existing stream letter for tests that depend on each other. Use `"depends_on": N` to declare that test N must pass first. Tests in the same stream share a sequential execution order; different streams run in parallel.
+19. **Artifact sweep.** After each local script execution, `core/artifact_sweep.py` diffs the filesystem to find newly created non-code files (txt, csv, json, etc.) in the project root and `programs/`. These get moved to `outputs/` automatically. Code files (.py, .sh, .c, etc.) stay where they are. Files written to explicit external paths (e.g. `~/Documents/report.txt`) are left alone — the sweep only touches the project root and `programs/`. Name collisions in `outputs/` are handled with timestamps.

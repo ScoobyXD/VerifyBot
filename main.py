@@ -45,6 +45,7 @@ if is_first_run():
     print("\n  Continuing to your prompt...\n")
 
 from core.session import ChatGPTSession
+from core.artifact_sweep import snapshot_dirs, sweep_artifacts
 from skills.chatgpt_skill import save_response, append_to_log
 from skills.ssh_skill import ssh_run, ssh_run_live, ssh_run_detached, sftp_upload, REMOTE_WORK_DIR
 from skills.extract_skill import (
@@ -776,6 +777,9 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             print(f"\n[4] Executing on {resolved}...")
             all_results = []
 
+            # Snapshot filesystem before execution so we can find new artifacts after
+            pre_snap = snapshot_dirs()
+
             # Commands (raspi only -- local uses Python for everything)
             if commands:
                 if resolved == "raspi":
@@ -823,6 +827,10 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                 print("\n  [WARN] Nothing executed.")
                 current_prompt = "None of the code was executable. Please provide a runnable Python script."
                 continue
+
+            # Sweep file artifacts created by the script into outputs/
+            if resolved == "local":
+                sweep_artifacts(pre_snap)
 
             # Log execution summary
             exec_log = ""
