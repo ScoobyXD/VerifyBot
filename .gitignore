@@ -1,6 +1,6 @@
 .env
 .browser_profile/
-.setup_complete
+core/.setup_complete
 raw_md/
 programs/
 outputs/

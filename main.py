@@ -643,8 +643,11 @@ def save_output(name: str, stdout: str, stderr: str, attempt: int) -> Path:
 
 def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                  timeout: int = 30, remote_dir: str = None,
-                 headed: bool = True):
-    """Main entry point. Prompt -> LLM -> execute -> verify -> retry."""
+                 headed: bool = True) -> bool:
+    """Main entry point. Prompt -> LLM -> execute -> verify -> retry.
+
+    Returns True if the LLM verified PASS, False otherwise.
+    """
 
     # Resolve target
     resolved = target or classify_target(prompt)
@@ -712,7 +715,8 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                 print(f"\n[DONE] LLM verified: PASS")
                 append_to_log(md_path, f"Prompt {attempt} Result",
                               "LLM VERIFIED: PASS")
-                break
+                print(f"\nLog: {md_path}")
+                return True
 
             # Handle install requests
             handle_installs(response, resolved)
@@ -825,12 +829,15 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                 print(f"\n[FAIL] Max retries ({max_retries}) reached.")
                 append_to_log(md_path, "Final Result",
                               f"FAILED after {max_retries} retries.")
-                break
+                print(f"\nLog: {md_path}")
+                return False
 
             print(f"\n[5] Asking ChatGPT to verify output...")
             current_prompt = build_verification_prompt(executed, prompt)
 
+    # Should not reach here, but safety net
     print(f"\nLog: {md_path}")
+    return False
 
 
 # ---------------------------------------------------------------------------

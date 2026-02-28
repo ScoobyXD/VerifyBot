@@ -47,8 +47,9 @@ The LLM is the brain. VerifyBot is just hands on the keyboard.
 ### After Setup
 
 - **Run again anytime**: `python main.py "your task here"`
+- **Run test suite**: `python tests.py` (or `python tests.py --test 1` for a single test)
 - **Re-login to ChatGPT**: `python main.py --login`
-- **Re-run setup**: Delete `.setup_complete` in the project root, then run any command.
+- **Re-run setup**: Delete `core/.setup_complete`, then run any command.
 - **Add a Raspberry Pi later**: Edit `.env` and fill in `PI_USER`, `PI_HOST`, `PI_PASSWORD`.
 
 ### Renaming Dotfiles After Download
@@ -77,11 +78,13 @@ python main.py "make a random word generator that saves to a text file"
 ```
 verifybot/
 ├── main.py                    # Entry point -- the entire pipeline
+├── tests.py              # End-to-end test suite (runs prompts through full pipeline)
 ├── core/
 │   ├── __init__.py            # Package marker
 │   ├── selectors.py           # ChatGPT DOM selectors (update when frontend changes)
 │   ├── session.py             # Persistent browser session (prompt, followup, new_chat)
-│   └── setup.py               # First-time setup wizard (runs once automatically)
+│   ├── setup.py               # First-time setup wizard (runs once automatically)
+│   └── .setup_complete        # Marker file -- exists after first-time setup (gitignored)
 ├── skills/
 │   ├── __init__.py            # Package marker
 │   ├── chatgpt_skill.py       # Browser automation wrapper, raw_md saving, login mode
@@ -100,7 +103,6 @@ verifybot/
 │   └── ...
 ├── raw_md/                    # Pipeline run transcripts (timestamped logs)
 ├── .env                       # Pi SSH credentials (PI_USER, PI_HOST, PI_PASSWORD)
-├── .setup_complete            # Marker file -- exists after first-time setup
 ├── .browser_profile/          # Chromium cookies (persistent ChatGPT login)
 ├── .gitignore
 └── LLM.md                     # This file
@@ -127,6 +129,9 @@ core/setup.py                (no internal imports, stdlib only)
 skills/ssh_skill.py          (no internal imports, reads .env)
 skills/extract_skill.py      (no internal imports, pure regex)
 core/selectors.py            (no imports, just constants)
+
+tests.py
+  └── main                   (run_pipeline)  -- imported at call time, not module level
 ```
 
 ## Key Design Decisions
@@ -243,4 +248,5 @@ playwright install chromium
 9. **Dotfiles lose their leading dot when downloaded from Claude.ai.** After downloading, rename `gitignore` to `.gitignore` and `env` to `.env`. This is a browser download artifact, not a bug in the code.
 10. **Pycache auto-cleanup.** `main.py` deletes all `__pycache__/` directories on startup. You do NOT need to manually delete them when updating files.
 11. **Browser login persistence.** ChatGPT cookies are saved in `.browser_profile/`. Run `python main.py --login` once to log in manually. If the browser opens without being logged in, your `.browser_profile/` directory may have been deleted or moved -- run `--login` again. Do NOT delete `.browser_profile/` unless you want to re-login.
-12. **First-run setup.** `.setup_complete` is a marker file created after the setup wizard finishes. Delete it to re-run setup. Do NOT commit it to git.
+12. **First-run setup.** `core/.setup_complete` is a marker file created after the setup wizard finishes. Delete it to re-run setup. Do NOT commit it to git.
+13. **Test suite.** `tests.py` runs real prompts through the full pipeline. It runs automatically during first-time setup and can be run anytime with `python tests.py`. Add new tests by appending to the `TESTS` list.

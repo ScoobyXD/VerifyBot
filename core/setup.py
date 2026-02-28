@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SETUP_MARKER = ROOT / ".setup_complete"
+SETUP_MARKER = ROOT / "core" / ".setup_complete"
 ENV_FILE = ROOT / ".env"
 PROFILE_DIR = ROOT / ".browser_profile"
 
@@ -36,27 +36,33 @@ def run_setup():
     _banner()
 
     # Step 1: Python dependencies
-    _step("1/5", "Installing Python packages")
+    _step("1/6", "Installing Python packages")
     _install_packages()
 
     # Step 2: Playwright browser
-    _step("2/5", "Installing Chromium browser for Playwright")
+    _step("2/6", "Installing Chromium browser for Playwright")
     _install_chromium()
 
     # Step 3: .env for Raspberry Pi
-    _step("3/5", "Raspberry Pi SSH credentials")
+    _step("3/6", "Raspberry Pi SSH credentials")
     _setup_env()
 
     # Step 4: ChatGPT browser login
-    _step("4/5", "ChatGPT browser login")
+    _step("4/6", "ChatGPT browser login")
     _setup_browser_login()
 
     # Step 5: Create directories
-    _step("5/5", "Creating project directories")
+    _step("5/6", "Creating project directories")
     _create_dirs()
 
-    # Done -- write marker
+    # Write marker before tests so we don't re-run setup if tests fail
     _write_marker()
+
+    # Step 6: Run test suite
+    _step("6/6", "Running test suite to verify everything works")
+    _run_tests()
+
+    # Done
     _done()
 
 
@@ -231,6 +237,36 @@ def _create_dirs():
         dirpath.mkdir(exist_ok=True)
         print(f"  [OK] {dirname}/")
     print("  All directories ready.")
+
+
+def _run_tests():
+    print()
+    print("  Now we'll run a quick test to make sure everything works.")
+    print("  This sends real prompts to ChatGPT and executes the results.")
+    print()
+    choice = input("  Run test suite? (y/n): ").strip().lower()
+
+    if choice != "y":
+        print("  [SKIP] You can run tests later with: python tests.py")
+        return
+
+    try:
+        # Import here to avoid circular imports — tests imports main
+        # which imports core.setup, but we only call is_first_run() at import
+        # time, and by now .setup_complete already exists.
+        sys.path.insert(0, str(ROOT))
+        from tests import run_tests
+        all_passed = run_tests(headed=True)
+        if all_passed:
+            print("  [OK] All tests passed! VerifyBot is working correctly.")
+        else:
+            print("  [WARN] Some tests failed. VerifyBot is installed but")
+            print("  may need troubleshooting. Try running individual tests:")
+            print("    python tests.py --test 1")
+    except Exception as e:
+        print(f"  [WARN] Test suite error: {e}")
+        print("  VerifyBot is installed. Run tests manually:")
+        print("    python tests.py")
 
 
 def _write_marker():
