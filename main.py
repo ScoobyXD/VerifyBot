@@ -206,7 +206,7 @@ def build_initial_prompt(user_prompt: str, context: str, target: str,
 def build_verification_prompt(executed: list[dict], original_task: str) -> str:
     """Build a prompt that asks the LLM to verify if the output is correct.
 
-    The LLM decides PASS or FAIL — not us.
+    The LLM decides PASS, FAIL, or REVISE — not us.
     """
     lines = [
         f"I ran your code. Here are the results.",
@@ -230,7 +230,8 @@ def build_verification_prompt(executed: list[dict], original_task: str) -> str:
         "Based on the output above, does this correctly complete the task?\n"
         "Respond with exactly one of:\n"
         "- PASS: if the task is complete and the output is correct\n"
-        "- FAIL: if there are errors or the output is wrong, and then provide the complete fixed code"
+        "- FAIL: if there are errors, and then provide the complete fixed code\n"
+        "- REVISE: if it partially works but needs changes, and then provide the complete revised code"
     )
 
     return "\n".join(lines)
@@ -393,9 +394,13 @@ def run_script_local(filepath: Path, timeout: int = 30) -> dict:
     print(f"  ├{sep}")
 
     # --- Run it ---
+    # Use the project root as cwd so the script's working directory
+    # matches the CWD reported in probe_local() context. Scripts are
+    # saved to programs/ but the LLM is told CWD is the project root,
+    # so file operations should resolve relative to there.
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              cwd=filepath.parent)
+                              cwd=ROOT)
         result = {"name": filepath.name, "success": proc.returncode == 0,
                   "exit_code": proc.returncode, "stdout": proc.stdout,
                   "stderr": proc.stderr, "timed_out": False}
@@ -452,7 +457,7 @@ def _compile_and_run_local(filepath: Path, timeout: int) -> dict:
     print(f"  ├{sep}")
 
     comp = subprocess.run([compiler, "-Wall", "-o", str(binary), str(filepath)],
-                          capture_output=True, text=True, timeout=30, cwd=filepath.parent)
+                          capture_output=True, text=True, timeout=30, cwd=ROOT)
     if comp.stdout:
         for line in comp.stdout.strip().split("\n"):
             print(f"  │ {line}")
@@ -473,7 +478,7 @@ def _compile_and_run_local(filepath: Path, timeout: int) -> dict:
 
     try:
         proc = subprocess.run([str(binary)], capture_output=True, text=True,
-                              timeout=timeout, cwd=filepath.parent)
+                              timeout=timeout, cwd=ROOT)
         result = {"name": filepath.name, "success": proc.returncode == 0,
                   "exit_code": proc.returncode, "stdout": proc.stdout,
                   "stderr": proc.stderr, "timed_out": False}

@@ -1,0 +1,17 @@
+Fibonacci 1: 1 -> a
+Fibonacci 2: 1 -> a
+Fibonacci 3: 2 -> b
+Fibonacci 4: 3 -> c
+Fibonacci 5: 5 -> e
+Fibonacci 6: 8 -> h
+Fibonacci 7: 13 -> m
+Fibonacci 8: 21 -> u
+Fibonacci 9: 34 -> h
+Fibonacci 10: 55 -> c
+Fibonacci 11: 89 -> k
+Fibonacci 12: 144 -> n
+Fibonacci 13: 233 -> y
+Fibonacci 14: 377 -> m
+Fibonacci 15: 610 -> l
+Final string: aabcehmuhcknyml
+Reversed string: lmynkchumhecbaa
