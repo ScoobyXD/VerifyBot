@@ -34,6 +34,16 @@ for _cache in Path(__file__).resolve().parent.rglob("__pycache__"):
         import shutil
         shutil.rmtree(_cache, ignore_errors=True)
 
+# --- First-run detection: run setup wizard before importing anything heavy ---
+from core.setup import is_first_run
+if is_first_run():
+    from core.setup import run_setup
+    run_setup()
+    # After setup, check if user wants to continue or exit
+    if len(sys.argv) <= 1 or "--login" in sys.argv:
+        sys.exit(0)
+    print("\n  Continuing to your prompt...\n")
+
 from core.session import ChatGPTSession
 from skills.chatgpt_skill import save_response, append_to_log
 from skills.ssh_skill import ssh_run, ssh_run_live, ssh_run_detached, sftp_upload, REMOTE_WORK_DIR

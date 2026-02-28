@@ -1,5 +1,6 @@
 .env
 .browser_profile/
+.setup_complete
 raw_md/
 programs/
 outputs/

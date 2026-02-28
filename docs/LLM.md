@@ -6,6 +6,59 @@ A Python tool that automates the copy-paste debugging cycle between an LLM (Chat
 
 The LLM is the brain. VerifyBot is just hands on the keyboard.
 
+## How To Use (New User Guide)
+
+### Quick Start
+
+1. **Get the code**: Download or clone the VerifyBot folder onto your computer.
+
+2. **Make sure you have Python 3.10+**: Open a terminal and run `python --version`. If you don't have Python, install it from https://python.org.
+
+3. **Run it**: Open a terminal in the VerifyBot folder and type:
+   ```bash
+   python main.py "hello"
+   ```
+   On your very first run, a setup wizard will automatically walk you through everything:
+   - Installing dependencies (playwright, paramiko)
+   - Installing the Chromium browser that VerifyBot uses
+   - Setting up Raspberry Pi SSH credentials (optional -- skip if you don't have one)
+   - Logging into ChatGPT through a browser window (your session gets saved)
+   - Creating all the folders VerifyBot needs
+
+4. **That's it.** After setup finishes, you can start using VerifyBot normally:
+   ```bash
+   python main.py "write a script that prints the first 20 prime numbers"
+   python main.py "make a random word generator" --target raspi
+   python main.py "create a file called notes.txt with my grocery list"
+   ```
+
+### What You Need
+
+- **Python 3.10+** (with pip)
+- **A ChatGPT account** (free or paid -- you log in through the browser)
+- **A Raspberry Pi** (optional -- only needed if you want to deploy code to it over SSH)
+
+### What You Do NOT Need
+
+- You do NOT need a `.browser_profile/` folder from someone else. The setup wizard creates your own.
+- You do NOT need an OpenAI API key. VerifyBot uses the free ChatGPT browser interface, not the API.
+- You do NOT need to install anything manually. The setup wizard handles pip packages, Playwright, and Chromium.
+
+### After Setup
+
+- **Run again anytime**: `python main.py "your task here"`
+- **Re-login to ChatGPT**: `python main.py --login`
+- **Re-run setup**: Delete `.setup_complete` in the project root, then run any command.
+- **Add a Raspberry Pi later**: Edit `.env` and fill in `PI_USER`, `PI_HOST`, `PI_PASSWORD`.
+
+### Renaming Dotfiles After Download
+
+If you downloaded files from Claude.ai, some dotfiles lose their leading dot:
+- Rename `gitignore` to `.gitignore`
+- Rename `env` to `.env` (or let the setup wizard create it for you)
+
+---
+
 ## How It Works
 
 ```
@@ -27,7 +80,8 @@ verifybot/
 ├── core/
 │   ├── __init__.py            # Package marker
 │   ├── selectors.py           # ChatGPT DOM selectors (update when frontend changes)
-│   └── session.py             # Persistent browser session (prompt, followup, new_chat)
+│   ├── session.py             # Persistent browser session (prompt, followup, new_chat)
+│   └── setup.py               # First-time setup wizard (runs once automatically)
 ├── skills/
 │   ├── __init__.py            # Package marker
 │   ├── chatgpt_skill.py       # Browser automation wrapper, raw_md saving, login mode
@@ -46,6 +100,7 @@ verifybot/
 │   └── ...
 ├── raw_md/                    # Pipeline run transcripts (timestamped logs)
 ├── .env                       # Pi SSH credentials (PI_USER, PI_HOST, PI_PASSWORD)
+├── .setup_complete            # Marker file -- exists after first-time setup
 ├── .browser_profile/          # Chromium cookies (persistent ChatGPT login)
 ├── .gitignore
 └── LLM.md                     # This file
@@ -55,6 +110,7 @@ verifybot/
 
 ```
 main.py
+  ├── core.setup            (is_first_run, run_setup)  -- checked before other imports
   ├── core.session          (ChatGPTSession)
   ├── skills.chatgpt_skill  (save_response, append_to_log)
   ├── skills.ssh_skill      (ssh_run, ssh_run_live, ssh_run_detached, sftp_upload)
@@ -67,6 +123,7 @@ skills/chatgpt_skill.py
 core/session.py
   └── core.selectors
 
+core/setup.py                (no internal imports, stdlib only)
 skills/ssh_skill.py          (no internal imports, reads .env)
 skills/extract_skill.py      (no internal imports, pure regex)
 core/selectors.py            (no imports, just constants)
@@ -107,8 +164,14 @@ When target is `local`, the LLM is told to ALWAYS write Python. Even for simple 
 ### Browser-based LLM, not API
 Uses Playwright to automate ChatGPT's browser UI. No API keys, no per-token costs. The LLM layer is a clean interface (core/session.py) that could be swapped for any browser-based LLM. Response detection uses a stability check -- after the stop-generating button disappears, it waits for content to stabilize before extracting, preventing premature extraction of partial responses.
 
+### First-time setup wizard
+On the very first run, `main.py` detects that `.setup_complete` doesn't exist and runs `core/setup.py` -- an interactive terminal wizard that installs dependencies, sets up the browser, configures Pi credentials, and creates directories. After setup, it writes `.setup_complete` and never runs again. Delete the marker file to re-run setup. The check happens before importing playwright or paramiko, so it works even on a totally fresh machine with no dependencies installed.
+
 ### Live terminal streaming for Pi execution
 When scripts or commands run on the Pi, output streams to your terminal in real-time via `ssh_run_live()`. You see every print statement, every error, every status message as it happens -- not just a captured dump after execution finishes. Output is formatted with box-drawing characters and color-coded (red for stderr). The original `ssh_run()` still exists for non-interactive use (probing, quick commands).
+
+### Visual code display for local execution
+When scripts run locally, the terminal shows: (1) the full source code with line numbers, (2) the exact command being executed, (3) the complete stdout and stderr output, and (4) the exit status. This makes it easy to see exactly what the LLM wrote and what happened when it ran.
 
 ### CRLF normalization on save
 Scripts extracted from ChatGPT's DOM on Windows may carry `\r\n` line endings. Before saving to `programs/`, all `\r` characters are stripped and files are written with explicit `\n` (Unix LF). This prevents `$'\r': command not found` errors when bash scripts are uploaded and run on the Pi.
@@ -155,6 +218,8 @@ python -m skills.ssh_skill --run "ls -la ~/Documents"
 
 ## Dependencies
 
+Dependencies are installed automatically by the first-time setup wizard. If you need to install manually:
+
 ```bash
 pip install playwright paramiko
 playwright install chromium
@@ -175,6 +240,7 @@ playwright install chromium
 6. The `programs/` directory keeps ALL versions. Files are named `slug_1.py`, `slug_2.py`, etc.
 7. The `outputs/` directory keeps ALL execution outputs. Same versioning scheme.
 8. `raw_md/` contains full pipeline transcripts for debugging VerifyBot itself.
-8. **Dotfiles lose their leading dot when downloaded from Claude.ai.** After downloading, rename `gitignore` to `.gitignore` and `env` to `.env`. This is a browser download artifact, not a bug in the code.
-9. **Pycache auto-cleanup.** `main.py` deletes all `__pycache__/` directories on startup. You do NOT need to manually delete them when updating files.
-10. **Browser login persistence.** ChatGPT cookies are saved in `.browser_profile/`. Run `python main.py --login` once to log in manually. If the browser opens without being logged in, your `.browser_profile/` directory may have been deleted or moved -- run `--login` again. Do NOT delete `.browser_profile/` unless you want to re-login.
+9. **Dotfiles lose their leading dot when downloaded from Claude.ai.** After downloading, rename `gitignore` to `.gitignore` and `env` to `.env`. This is a browser download artifact, not a bug in the code.
+10. **Pycache auto-cleanup.** `main.py` deletes all `__pycache__/` directories on startup. You do NOT need to manually delete them when updating files.
+11. **Browser login persistence.** ChatGPT cookies are saved in `.browser_profile/`. Run `python main.py --login` once to log in manually. If the browser opens without being logged in, your `.browser_profile/` directory may have been deleted or moved -- run `--login` again. Do NOT delete `.browser_profile/` unless you want to re-login.
+12. **First-run setup.** `.setup_complete` is a marker file created after the setup wizard finishes. Delete it to re-run setup. Do NOT commit it to git.
