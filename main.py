@@ -36,7 +36,7 @@ for _cache in Path(__file__).resolve().parent.rglob("__pycache__"):
 
 from core.session import ChatGPTSession
 from skills.chatgpt_skill import save_response, append_to_log
-from skills.ssh_skill import ssh_run, ssh_run_detached, sftp_upload, REMOTE_WORK_DIR
+from skills.ssh_skill import ssh_run, ssh_run_live, ssh_run_detached, sftp_upload, REMOTE_WORK_DIR
 from skills.extract_skill import (
     extract_blocks, extract_filename_hint, extract_timeout_hint,
     classify_blocks, CodeBlock,
@@ -258,16 +258,15 @@ def classify_target(prompt: str) -> str:
 # ---------------------------------------------------------------------------
 
 def run_commands_on_pi(commands: list[str], timeout: int = 15) -> list[dict]:
-    """Run bash commands on Pi via SSH."""
+    """Run bash commands on Pi via SSH with live terminal output."""
     results = []
     for cmd in commands:
         print(f"  [SSH] {cmd}")
-        r = ssh_run(cmd, timeout=timeout)
+        r = ssh_run_live(cmd, timeout=timeout, label="CMD")
         result = {"cmd": cmd, "name": cmd[:60], "success": r["success"],
                   "exit_code": r["exit_code"], "stdout": r["stdout"],
                   "stderr": r["stderr"], "timed_out": r.get("timed_out", False),
                   "timeout": timeout}
-        _print_output(r)
         results.append(result)
     return results
 
@@ -314,8 +313,8 @@ def run_script_on_pi(filepath: Path, remote_dir: str, timeout: int = 30,
                 "timed_out": False, "detached": True}
 
     print(f"  [RUN] Pi: {executor} {filepath.name}")
-    r = ssh_run(run_cmd, timeout=timeout)
-    _print_output(r)
+    r = ssh_run_live(run_cmd, timeout=timeout, label=f"RUN {filepath.name}")
+    # _print_output(r)  -- ssh_run_live already streams output live
 
     success = r["success"]
     if r.get("timed_out") and r["stdout"].strip():
@@ -335,15 +334,14 @@ def _compile_and_run_on_pi(filepath: Path, rdir: str, timeout: int) -> dict:
     binary = filepath.stem
 
     print(f"  [COMPILE] {compiler} -Wall -o {binary} {filepath.name}")
-    compile_r = ssh_run(f"cd {rdir} && {compiler} -Wall -o {binary} {filepath.name}", timeout=30)
+    compile_r = ssh_run_live(f"cd {rdir} && {compiler} -Wall -o {binary} {filepath.name}",
+                             timeout=30, label=f"COMPILE {filepath.name}")
     if not compile_r["success"]:
-        _print_output(compile_r)
         return {"name": filepath.name, "success": False, "exit_code": compile_r["exit_code"],
                 "stdout": compile_r["stdout"], "stderr": compile_r["stderr"], "timed_out": False}
 
     print(f"  [RUN] Pi: ./{binary}")
-    r = ssh_run(f"cd {rdir} && ./{binary}", timeout=timeout)
-    _print_output(r)
+    r = ssh_run_live(f"cd {rdir} && ./{binary}", timeout=timeout, label=f"RUN {binary}")
     return {"name": filepath.name, "success": r["success"], "exit_code": r["exit_code"],
             "stdout": r["stdout"], "stderr": r["stderr"],
             "timed_out": r.get("timed_out", False), "timeout": timeout}
@@ -518,8 +516,11 @@ def save_script(block: CodeBlock, prompt: str, response_text: str,
     fname = f"{base}_{attempt}{block.extension}"
     filepath = PROGRAMS_DIR / fname
 
-    filepath.write_text(block.code, encoding="utf-8")
-    print(f"  [SAVED] {filepath.name} ({len(block.code)} chars)")
+    # Strip Windows \r line endings -- scripts extracted from ChatGPT's DOM
+    # on Windows may carry \r\n, which breaks bash execution on Linux targets.
+    clean_code = block.code.replace("\r\n", "\n").replace("\r", "\n")
+    filepath.write_text(clean_code, encoding="utf-8", newline="\n")
+    print(f"  [SAVED] {filepath.name} ({len(clean_code)} chars)")
     return filepath
 
 

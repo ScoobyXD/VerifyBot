@@ -17,6 +17,7 @@ import argparse
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -145,6 +146,114 @@ def ssh_run(command: str, timeout: int = 30) -> dict:
     except Exception as e:
         return {"stdout": "", "stderr": f"[ERROR] {e}",
                 "exit_code": -1, "success": False, "timed_out": False}
+
+
+def ssh_run_live(command: str, timeout: int = 30, label: str = "") -> dict:
+    """Run a command on Pi via SSH with LIVE terminal output.
+
+    Streams stdout/stderr to the local terminal in real-time so you
+    can watch execution as it happens. Returns the same dict as ssh_run.
+    """
+    prefix = f"  [{label}]" if label else "  [PI]"
+    separator = f"{'─' * 50}"
+
+    try:
+        client = _connect()
+        transport = client.get_transport()
+        channel = transport.open_session()
+        channel.settimeout(timeout)
+        channel.exec_command(command)
+
+        print(f"{prefix} ┌{separator}")
+        print(f"{prefix} │ $ {command[:80]}{'...' if len(command) > 80 else ''}")
+        print(f"{prefix} ├{separator}")
+
+        out_buf = []
+        err_buf = []
+        exit_code = [None]
+
+        def wait_for_exit():
+            try:
+                exit_code[0] = channel.recv_exit_status()
+            except Exception:
+                pass
+
+        waiter = threading.Thread(target=wait_for_exit, daemon=True)
+        waiter.start()
+
+        # Stream output in real-time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            # Check stdout
+            while channel.recv_ready():
+                chunk = channel.recv(4096).decode("utf-8", errors="replace")
+                out_buf.append(chunk)
+                for line in chunk.splitlines(keepends=True):
+                    clean = line.rstrip('\n\r')
+                    if clean:
+                        print(f"{prefix} │ {clean}")
+
+            # Check stderr
+            while channel.recv_stderr_ready():
+                chunk = channel.recv_stderr(4096).decode("utf-8", errors="replace")
+                err_buf.append(chunk)
+                for line in chunk.splitlines(keepends=True):
+                    clean = line.rstrip('\n\r')
+                    if clean:
+                        print(f"{prefix} │ \033[91m{clean}\033[0m")  # red for stderr
+
+            # Check if process ended
+            if not waiter.is_alive():
+                # Drain remaining output
+                time.sleep(0.1)
+                while channel.recv_ready():
+                    chunk = channel.recv(4096).decode("utf-8", errors="replace")
+                    out_buf.append(chunk)
+                    for line in chunk.splitlines(keepends=True):
+                        clean = line.rstrip('\n\r')
+                        if clean:
+                            print(f"{prefix} │ {clean}")
+                while channel.recv_stderr_ready():
+                    chunk = channel.recv_stderr(4096).decode("utf-8", errors="replace")
+                    err_buf.append(chunk)
+                    for line in chunk.splitlines(keepends=True):
+                        clean = line.rstrip('\n\r')
+                        if clean:
+                            print(f"{prefix} │ \033[91m{clean}\033[0m")
+                break
+
+            time.sleep(0.1)
+
+        timed_out = waiter.is_alive()
+        stdout = "".join(out_buf)
+        stderr = "".join(err_buf)
+        ec = exit_code[0] if exit_code[0] is not None else -1
+
+        if timed_out:
+            print(f"{prefix} │ \033[93m[TIMED OUT after {timeout}s]\033[0m")
+
+        status = "OK" if ec == 0 else f"EXIT {ec}"
+        color = "\033[92m" if ec == 0 else "\033[91m"
+        print(f"{prefix} └{separator} {color}{status}\033[0m")
+
+        try:
+            channel.close()
+        except Exception:
+            pass
+        client.close()
+
+        return {"stdout": stdout, "stderr": stderr, "exit_code": ec,
+                "success": ec == 0, "timed_out": timed_out}
+
+    except paramiko.AuthenticationException:
+        print(f"{prefix} └{separator} \033[91mAUTH FAILED\033[0m")
+        return {"stdout": "", "stderr": "[ERROR] Auth failed -- check .env",
+                "exit_code": -1, "success": False, "timed_out": False}
+    except Exception as e:
+        print(f"{prefix} └{separator} \033[91mERROR: {e}\033[0m")
+        return {"stdout": "", "stderr": f"[ERROR] {e}",
+                "exit_code": -1, "success": False, "timed_out": False}
+
 
 
 def ssh_run_detached(command: str) -> dict:

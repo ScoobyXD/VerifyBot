@@ -57,7 +57,7 @@ verifybot/
 main.py
   ├── core.session          (ChatGPTSession)
   ├── skills.chatgpt_skill  (save_response, append_to_log)
-  ├── skills.ssh_skill      (ssh_run, ssh_run_detached, sftp_upload)
+  ├── skills.ssh_skill      (ssh_run, ssh_run_live, ssh_run_detached, sftp_upload)
   └── skills.extract_skill  (extract_blocks, classify_blocks, extract_timeout_hint)
 
 skills/chatgpt_skill.py
@@ -106,6 +106,12 @@ When target is `local`, the LLM is told to ALWAYS write Python. Even for simple 
 
 ### Browser-based LLM, not API
 Uses Playwright to automate ChatGPT's browser UI. No API keys, no per-token costs. The LLM layer is a clean interface (core/session.py) that could be swapped for any browser-based LLM. Response detection uses a stability check -- after the stop-generating button disappears, it waits for content to stabilize before extracting, preventing premature extraction of partial responses.
+
+### Live terminal streaming for Pi execution
+When scripts or commands run on the Pi, output streams to your terminal in real-time via `ssh_run_live()`. You see every print statement, every error, every status message as it happens -- not just a captured dump after execution finishes. Output is formatted with box-drawing characters and color-coded (red for stderr). The original `ssh_run()` still exists for non-interactive use (probing, quick commands).
+
+### CRLF normalization on save
+Scripts extracted from ChatGPT's DOM on Windows may carry `\r\n` line endings. Before saving to `programs/`, all `\r` characters are stripped and files are written with explicit `\n` (Unix LF). This prevents `$'\r': command not found` errors when bash scripts are uploaded and run on the Pi.
 
 ### Compilation happens on the target
 C/C++ files are uploaded to the Pi (or kept local) and compiled there. No cross-compilation complexity. The target machine has the right toolchain for itself.
