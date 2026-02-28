@@ -24,10 +24,19 @@ PROFILE_DIR = Path(__file__).resolve().parent.parent / ".browser_profile"
 
 
 class ChatGPTSession:
-    """Persistent ChatGPT browser session."""
+    """Persistent ChatGPT browser session.
 
-    def __init__(self, headed: bool = True):
+    Args:
+        headed: Show browser window (True) or run headless (False).
+        profile_dir: Override browser profile directory. Defaults to
+                     .browser_profile/ in the project root. For parallel
+                     agents, pass a unique directory per agent -- each
+                     Chromium instance needs its own user_data_dir.
+    """
+
+    def __init__(self, headed: bool = True, profile_dir: Path = None):
         self._headed = headed
+        self._profile_dir = profile_dir or PROFILE_DIR
         self._pw = None
         self._ctx = None
         self._page = None
@@ -36,9 +45,9 @@ class ChatGPTSession:
 
     def __enter__(self):
         self._pw = sync_playwright().start()
-        PROFILE_DIR.mkdir(exist_ok=True)
+        self._profile_dir.mkdir(parents=True, exist_ok=True)
         self._ctx = self._pw.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
+            user_data_dir=str(self._profile_dir),
             headless=not self._headed,
             viewport={"width": 1280, "height": 900},
             args=["--disable-blink-features=AutomationControlled"],

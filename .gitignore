@@ -1,5 +1,6 @@
 .env
 .browser_profile/
+.browser_profile_*/
 core/.setup_complete
 raw_md/
 programs/

@@ -643,8 +643,12 @@ def save_output(name: str, stdout: str, stderr: str, attempt: int) -> Path:
 
 def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                  timeout: int = 30, remote_dir: str = None,
-                 headed: bool = True) -> bool:
+                 headed: bool = True, profile_dir: Path = None) -> bool:
     """Main entry point. Prompt -> LLM -> execute -> verify -> retry.
+
+    Args:
+        profile_dir: Override browser profile directory. For parallel
+                     agents, pass a unique directory per agent.
 
     Returns True if the LLM verified PASS, False otherwise.
     """
@@ -676,7 +680,7 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     md_path = save_response(prompt, "(pipeline started)", prompt_num=0)
 
-    with ChatGPTSession(headed=headed) as session:
+    with ChatGPTSession(headed=headed, profile_dir=profile_dir) as session:
         current_prompt = initial_prompt
         is_followup = False
 
