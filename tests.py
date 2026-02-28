@@ -39,6 +39,13 @@ TESTS = [
                   "each step, and prints everything clearly",
         "target": "local",
     },
+    {
+        "name": "Cleanup test folder",
+        "prompt": "Delete the folder called verifybot_test in my directory and everything "
+                  "inside it. Confirm it no longer exists after deletion.",
+        "target": "local",
+        "depends_on": 1,  # only runs if test 1 passed
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -80,11 +87,26 @@ def run_tests(test_indices: list = None, target_override: str = None,
     print("=" * 60)
 
     results = []
+    passed_tests = set()  # track which test numbers passed (for depends_on)
     start_time = time.time()
 
     for num, test in tests_to_run:
         target = target_override or test.get("target", "local")
         prompt = test["prompt"]
+
+        # Check dependency -- skip if the test we depend on didn't pass
+        dep = test.get("depends_on")
+        if dep is not None and dep not in passed_tests:
+            print()
+            print(f"  {'─' * 56}")
+            print(f"  TEST {num}/{len(TESTS)}: {test['name']}")
+            print(f"  \033[93m[SKIP] Depends on test {dep} which did not pass\033[0m")
+            print(f"  {'─' * 56}")
+            results.append({
+                "num": num, "name": test["name"],
+                "passed": False, "skipped": True, "elapsed": 0,
+            })
+            continue
 
         print()
         print(f"  {'─' * 56}")
@@ -110,6 +132,9 @@ def run_tests(test_indices: list = None, target_override: str = None,
 
         elapsed = time.time() - test_start
 
+        if passed:
+            passed_tests.add(num)
+
         status = "PASS" if passed else "FAIL"
         color = "\033[92m" if passed else "\033[91m"
         print(f"\n  {color}[{status}]\033[0m Test {num}: {test['name']} ({elapsed:.1f}s)")
@@ -132,11 +157,18 @@ def run_tests(test_indices: list = None, target_override: str = None,
     print("=" * 60)
 
     for r in results:
-        status = "\033[92mPASS\033[0m" if r["passed"] else "\033[91mFAIL\033[0m"
+        if r.get("skipped"):
+            status = "\033[93mSKIP\033[0m"
+        elif r["passed"]:
+            status = "\033[92mPASS\033[0m"
+        else:
+            status = "\033[91mFAIL\033[0m"
         print(f"  [{status}] Test {r['num']}: {r['name']} ({r['elapsed']:.1f}s)")
 
     print(f"  {'─' * 56}")
-    print(f"  Total: {len(results)} tests, {passed_count} passed, {failed_count} failed")
+    skipped_count = sum(1 for r in results if r.get("skipped"))
+    print(f"  Total: {len(results)} tests, {passed_count} passed, {failed_count} failed"
+          f"{f', {skipped_count} skipped' if skipped_count else ''}")
     print(f"  Time:  {total_time:.1f}s")
 
     if failed_count == 0:
