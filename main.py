@@ -314,7 +314,6 @@ def run_script_on_pi(filepath: Path, remote_dir: str, timeout: int = 30,
 
     print(f"  [RUN] Pi: {executor} {filepath.name}")
     r = ssh_run_live(run_cmd, timeout=timeout, label=f"RUN {filepath.name}")
-    # _print_output(r)  -- ssh_run_live already streams output live
 
     success = r["success"]
     if r.get("timed_out") and r["stdout"].strip():
@@ -352,15 +351,14 @@ def _compile_and_run_on_pi(filepath: Path, rdir: str, timeout: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def run_script_local(filepath: Path, timeout: int = 30) -> dict:
-    """Run a script locally. Only Python and C/C++ are supported."""
+    """Run a script locally. Shows the full script code and full output."""
     ext = filepath.suffix.lower()
 
     if ext == ".py":
-        cmd = [sys.executable, str(filepath)]
+        cmd = [sys.executable, "-u", str(filepath)]
     elif ext in (".c", ".cpp"):
         return _compile_and_run_local(filepath, timeout)
     else:
-        # Local target only runs Python. If the LLM wrote bash, tell it.
         return {"name": filepath.name, "success": False, "exit_code": -1,
                 "stdout": "",
                 "stderr": (f"[ERROR] Cannot execute {ext} locally. "
@@ -369,7 +367,23 @@ def run_script_local(filepath: Path, timeout: int = 30) -> dict:
                            f"for any shell commands."),
                 "timed_out": False}
 
-    print(f"  [RUN] {' '.join(cmd)}")
+    sep = "─" * 60
+
+    # --- Show the script code ---
+    print(f"\n  ┌{sep}")
+    print(f"  │ SCRIPT: {filepath.name}")
+    print(f"  ├{sep}")
+    try:
+        code_lines = filepath.read_text(encoding="utf-8").split("\n")
+        for i, line in enumerate(code_lines, 1):
+            print(f"  │ {i:3d} │ {line}")
+    except Exception:
+        print(f"  │ (could not read file)")
+    print(f"  ├{sep}")
+    print(f"  │ EXECUTING: {' '.join(cmd)}")
+    print(f"  ├{sep}")
+
+    # --- Run it ---
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                               cwd=filepath.parent)
@@ -380,34 +394,104 @@ def run_script_local(filepath: Path, timeout: int = 30) -> dict:
         result = {"name": filepath.name, "success": False, "exit_code": -1,
                   "stdout": e.stdout or "", "stderr": e.stderr or "",
                   "timed_out": True, "timeout": timeout}
-    _print_output_local(result)
+
+    # --- Show full output ---
+    if result.get("stdout"):
+        for line in result["stdout"].split("\n"):
+            line = line.rstrip("\r\n")
+            if line:
+                print(f"  │ {line}")
+    if result.get("stderr"):
+        for line in result["stderr"].split("\n"):
+            line = line.rstrip("\r\n")
+            if line:
+                print(f"  │ \033[91m{line}\033[0m")
+    if result.get("timed_out"):
+        print(f"  │ \033[93m[TIMED OUT after {timeout}s]\033[0m")
+    if not result.get("stdout") and not result.get("stderr"):
+        print(f"  │ (no output)")
+
+    ec = result["exit_code"]
+    status = "OK" if ec == 0 else f"EXIT {ec}"
+    color = "\033[92m" if ec == 0 else "\033[91m"
+    print(f"  └{sep} {color}{status}\033[0m")
+
     return result
 
 
 def _compile_and_run_local(filepath: Path, timeout: int) -> dict:
-    """Compile and run C/C++ locally."""
+    """Compile and run C/C++ locally. Shows code, compilation, and output."""
     ext = filepath.suffix.lower()
     compiler = "gcc" if ext == ".c" else "g++"
     binary = filepath.with_suffix("" if os.name != "nt" else ".exe")
+    sep = "─" * 60
 
-    print(f"  [COMPILE] {compiler} -Wall -o {binary.name} {filepath.name}")
+    # --- Show the source code ---
+    print(f"\n  ┌{sep}")
+    print(f"  │ SOURCE: {filepath.name}")
+    print(f"  ├{sep}")
+    try:
+        code_lines = filepath.read_text(encoding="utf-8").split("\n")
+        for i, line in enumerate(code_lines, 1):
+            print(f"  │ {i:3d} │ {line}")
+    except Exception:
+        print(f"  │ (could not read file)")
+
+    # --- Compile ---
+    print(f"  ├{sep}")
+    print(f"  │ COMPILING: {compiler} -Wall -o {binary.name} {filepath.name}")
+    print(f"  ├{sep}")
+
     comp = subprocess.run([compiler, "-Wall", "-o", str(binary), str(filepath)],
                           capture_output=True, text=True, timeout=30, cwd=filepath.parent)
+    if comp.stdout:
+        for line in comp.stdout.strip().split("\n"):
+            print(f"  │ {line}")
+    if comp.stderr:
+        for line in comp.stderr.strip().split("\n"):
+            print(f"  │ \033[91m{line}\033[0m")
+
     if comp.returncode != 0:
+        print(f"  └{sep} \033[91mCOMPILE FAILED\033[0m")
         return {"name": filepath.name, "success": False, "exit_code": comp.returncode,
                 "stdout": comp.stdout, "stderr": comp.stderr, "timed_out": False}
 
-    print(f"  [RUN] {binary.name}")
+    # --- Run ---
+    print(f"  │ Compilation OK")
+    print(f"  ├{sep}")
+    print(f"  │ EXECUTING: ./{binary.name}")
+    print(f"  ├{sep}")
+
     try:
         proc = subprocess.run([str(binary)], capture_output=True, text=True,
                               timeout=timeout, cwd=filepath.parent)
-        return {"name": filepath.name, "success": proc.returncode == 0,
-                "exit_code": proc.returncode, "stdout": proc.stdout,
-                "stderr": proc.stderr, "timed_out": False}
+        result = {"name": filepath.name, "success": proc.returncode == 0,
+                  "exit_code": proc.returncode, "stdout": proc.stdout,
+                  "stderr": proc.stderr, "timed_out": False}
     except subprocess.TimeoutExpired as e:
-        return {"name": filepath.name, "success": False, "exit_code": -1,
-                "stdout": e.stdout or "", "stderr": e.stderr or "",
-                "timed_out": True, "timeout": timeout}
+        result = {"name": filepath.name, "success": False, "exit_code": -1,
+                  "stdout": e.stdout or "", "stderr": e.stderr or "",
+                  "timed_out": True, "timeout": timeout}
+
+    if result.get("stdout"):
+        for line in result["stdout"].split("\n"):
+            line = line.rstrip("\r\n")
+            if line:
+                print(f"  │ {line}")
+    if result.get("stderr"):
+        for line in result["stderr"].split("\n"):
+            line = line.rstrip("\r\n")
+            if line:
+                print(f"  │ \033[91m{line}\033[0m")
+    if result.get("timed_out"):
+        print(f"  │ \033[93m[TIMED OUT after {timeout}s]\033[0m")
+
+    ec = result["exit_code"]
+    status = "OK" if ec == 0 else f"EXIT {ec}"
+    color = "\033[92m" if ec == 0 else "\033[91m"
+    print(f"  └{sep} {color}{status}\033[0m")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -516,8 +600,8 @@ def save_script(block: CodeBlock, prompt: str, response_text: str,
     fname = f"{base}_{attempt}{block.extension}"
     filepath = PROGRAMS_DIR / fname
 
-    # Strip Windows \r line endings -- scripts extracted from ChatGPT's DOM
-    # on Windows may carry \r\n, which breaks bash execution on Linux targets.
+    # Strip Windows \r line endings -- scripts from ChatGPT's DOM
+    # may carry \r\n, which breaks bash on Linux targets.
     clean_code = block.code.replace("\r\n", "\n").replace("\r", "\n")
     filepath.write_text(clean_code, encoding="utf-8", newline="\n")
     print(f"  [SAVED] {filepath.name} ({len(clean_code)} chars)")
