@@ -206,7 +206,7 @@ def build_initial_prompt(user_prompt: str, context: str, target: str,
 def build_verification_prompt(executed: list[dict], original_task: str) -> str:
     """Build a prompt that asks the LLM to verify if the output is correct.
 
-    The LLM decides PASS, FAIL, or REVISE — not us.
+    The LLM decides PASS or FAIL — not us.
     """
     lines = [
         f"I ran your code. Here are the results.",
@@ -230,8 +230,7 @@ def build_verification_prompt(executed: list[dict], original_task: str) -> str:
         "Based on the output above, does this correctly complete the task?\n"
         "Respond with exactly one of:\n"
         "- PASS: if the task is complete and the output is correct\n"
-        "- FAIL: if there are errors, and then provide the complete fixed code\n"
-        "- REVISE: if it partially works but needs changes, and then provide the complete revised code"
+        "- FAIL: if there are errors or the output is wrong, and then provide the complete fixed code"
     )
 
     return "\n".join(lines)

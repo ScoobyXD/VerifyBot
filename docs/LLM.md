@@ -144,7 +144,7 @@ tests.py
 VerifyBot does NOT try to diagnose errors, pick strategies, or add intelligence. It captures output faithfully and sends it back to the LLM. As LLMs improve, the tool gets better for free. Hardcoding heuristics is a losing game.
 
 ### LLM verifies output, not exit codes
-After executing code, VerifyBot sends the full stdout/stderr back to ChatGPT and asks: "Does this correctly complete the task?" The LLM responds PASS, FAIL (with fix), or REVISE (with changes). This means even a program that exits 0 but produces wrong output gets caught. VerifyBot never decides success or failure — the LLM does.
+After executing code, VerifyBot sends the full stdout/stderr back to ChatGPT and asks: "Does this correctly complete the task?" The LLM responds PASS or FAIL (with fix). FAIL covers both hard errors (crashes, exceptions) and wrong output (runs but produces incorrect results). This means even a program that exits 0 but produces wrong output gets caught. VerifyBot never decides success or failure — the LLM does.
 
 ### Versioned programs and outputs — never overwrite
 Every attempt saves files with `_1`, `_2`, `_3` suffixes. `programs/prime_gen_1.py` is attempt 1, `programs/prime_gen_2.py` is the fix. `outputs/prime_gen_1.txt` has the stdout/stderr from attempt 1. You always have full history to see what changed between versions. Duplicate scripts (identical code across prompts) are automatically detected and skipped.
