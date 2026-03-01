@@ -1,4 +1,4 @@
-# VerifyBot v2 -- LLM-Driven Hardware Debug Loop
+# Agent v2 -- LLM-Driven Software/Hardware Loop
 
 ## What This Is
 

@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -28,7 +29,8 @@ def save_response(prompt: str, response: str, prompt_num: int = None) -> Path:
     """Save a prompt/response pair as timestamped markdown."""
     RAW_MD_DIR.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    slug = prompt[:40].replace(" ", "_").replace("/", "_")
+    # Sanitize: replace any character that's invalid in Windows filenames
+    slug = re.sub(r'[\\/:*?"<>|]+', '_', prompt[:40]).replace(" ", "_")
     filename = f"{ts}_{slug}.md"
     filepath = RAW_MD_DIR / filename
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py -- VerifyBot v2: LLM-driven hardware debug loop.
+main.py -- Agent v2: LLM-driven software/hardware loop.
 
 One command does everything:
     python main.py "make a random word generator that saves to a text file"
@@ -162,7 +162,7 @@ def _get_git_branch() -> str:
 
 def build_initial_prompt(user_prompt: str, context: str, target: str,
                          remote_dir: str = None) -> str:
-    """Build the first prompt with full system context as a single dense blob."""
+    """Build the first prompt with structured sections for clarity."""
     rdir = remote_dir or REMOTE_WORK_DIR
     target_desc = "Raspberry Pi 5 via SSH" if target == "raspi" else "this local machine"
 
@@ -172,35 +172,43 @@ def build_initial_prompt(user_prompt: str, context: str, target: str,
 
     # Execution environment differs by target
     if target == "raspi":
-        exec_note = (
-            "EXECUTION ENVIRONMENT: My runner uploads your code to the Pi and executes it via SSH. "
-            "Supported: Python (.py), Bash (.sh), C/C++ (.c/.cpp, compiled on Pi). "
+        exec_env = (
+            "- My runner uploads your code to the Pi and executes it via SSH.\n"
+            "- Supported languages: Python (.py), Bash (.sh), C/C++ (.c/.cpp, compiled on Pi)."
         )
     else:
-        exec_note = (
-            "EXECUTION ENVIRONMENT: My runner saves your code to a .py file and executes it with Python. "
-            "ALWAYS write Python, even for simple tasks like creating folders, moving files, or running git commands. "
-            "Use subprocess.run() for any system/git/shell commands. "
-            "Use os, shutil, pathlib for file operations. "
-            "NEVER write bash/shell scripts for local execution -- only Python works here. "
+        exec_env = (
+            "- My runner saves your code to a .py file and executes it with Python.\n"
+            "- ALWAYS write Python, even for simple tasks (folders, file ops, git, shell commands).\n"
+            "- Use subprocess.run() for system/shell commands. Use os, shutil, pathlib for file ops.\n"
+            "- NEVER write bash/shell scripts -- only Python works here."
         )
 
     return (
-        f"You are helping me debug and write code for hardware. "
-        f"Code will be deployed and executed on: {target_desc}. "
-        f"{ctx_compact} "
-        f"{exec_note}"
-        f"RULES: SIMPLICITY FIRST: prefer the simplest, most direct solution. "
-        f"Avoid over-engineering. Fewer lines = fewer bugs. "
-        f"Put ALL code inside exactly ONE fenced code block (```language\\n...code...\\n```). "
-        f"Do NOT put any text after the closing of your code block. "
-        f"No usage instructions, no \"how to run\", no \"save as\". "
-        f"If you need multiple files or steps, put them ALL in one script that handles everything. "
-        f"If you need a package installed, include INSTALL: package1, package2 at the top of your response. "
-        f"If this will take longer than 30 seconds to run, include TIMEOUT: <seconds> at the top of your response. "
-        f"ASCII only in code output. No emojis. "
-        f"Print clear status messages so I can see what happened.\n\n"
-        f"TASK: {user_prompt}\n"
+        f"=== ROLE ===\n"
+        f"You are helping me debug and write code for hardware.\n"
+        f"Code will be deployed and executed on: {target_desc}.\n"
+        f"\n"
+        f"=== SYSTEM CONTEXT ===\n"
+        f"{ctx_compact}\n"
+        f"\n"
+        f"=== EXECUTION ENVIRONMENT ===\n"
+        f"{exec_env}\n"
+        f"\n"
+        f"=== RESPONSE FORMAT ===\n"
+        f"- Put ALL code inside exactly ONE fenced code block (```language\\n...code...\\n```).\n"
+        f"- Do NOT put any text after the closing ```. No usage instructions, no \"how to run\", no \"save as\".\n"
+        f"- If you need multiple files or steps, combine them into ONE script.\n"
+        f"- If you need a package installed, include INSTALL: package1, package2 BEFORE the code block.\n"
+        f"- If this will take longer than 30s to run, include TIMEOUT: <seconds> BEFORE the code block.\n"
+        f"\n"
+        f"=== RULES ===\n"
+        f"- SIMPLICITY FIRST: prefer the simplest, most direct solution. Fewer lines = fewer bugs.\n"
+        f"- ASCII only in code output. No emojis.\n"
+        f"- Print clear status messages so I can see what happened.\n"
+        f"\n"
+        f"=== TASK ===\n"
+        f"{user_prompt}\n"
     )
 
 
@@ -663,7 +671,7 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
     detach = is_long_running(prompt)
 
     print("=" * 60)
-    print(f"VerifyBot v2")
+    print(f"Agent v2")
     print(f"  Target:  {resolved}")
     print(f"  Prompt:  {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
     print(f"  Retries: {max_retries}")
@@ -862,7 +870,7 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="VerifyBot v2: LLM-driven hardware debug loop",
+        description="Agent v2: LLM-driven software/hardware loop",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
