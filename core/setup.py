@@ -1,5 +1,5 @@
 """
-setup.py -- First-time setup wizard for VerifyBot.
+setup.py -- First-time setup wizard for agent.
 
 Runs automatically on the very first launch. Walks the user through:
     1. Installing Python dependencies (playwright, paramiko)
@@ -73,10 +73,10 @@ def run_setup():
 def _banner():
     print()
     print("=" * 60)
-    print("  VERIFYBOT -- FIRST TIME SETUP")
+    print("  AGENT -- FIRST TIME SETUP")
     print("=" * 60)
     print()
-    print("  Looks like this is your first time running VerifyBot.")
+    print("  Looks like this is your first time running agent.")
     print("  This wizard will get everything set up for you.")
     print("  It only runs once.")
     print()
@@ -136,7 +136,7 @@ def _setup_env():
         return
 
     print()
-    print("  VerifyBot can deploy code to a Raspberry Pi over SSH.")
+    print("  Agent can deploy code to a Raspberry Pi over SSH.")
     print("  If you don't have a Pi, just skip this step.")
     print()
     choice = input("  Do you have a Raspberry Pi to connect to? (y/n): ").strip().lower()
@@ -195,7 +195,7 @@ def _setup_env():
 
 def _setup_browser_login():
     print()
-    print("  VerifyBot uses ChatGPT through a browser window.")
+    print("  Agent uses ChatGPT through a browser window.")
     print("  You need to log in once so your session is saved.")
     print()
     print("  A Chromium browser will open. Log into ChatGPT,")
@@ -258,14 +258,14 @@ def _run_tests():
         from tests import run_tests
         all_passed = run_tests(headed=True)
         if all_passed:
-            print("  [OK] All tests passed! VerifyBot is working correctly.")
+            print("  [OK] All tests passed! Agent is working correctly.")
         else:
-            print("  [WARN] Some tests failed. VerifyBot is installed but")
+            print("  [WARN] Some tests failed. Agent is installed but")
             print("  may need troubleshooting. Try running individual tests:")
             print("    python tests.py --test 1")
     except Exception as e:
         print(f"  [WARN] Test suite error: {e}")
-        print("  VerifyBot is installed. Run tests manually:")
+        print("  Agent is installed. Run tests manually:")
         print("    python tests.py")
 
 
@@ -285,7 +285,7 @@ def _done():
     print("  SETUP COMPLETE!")
     print("=" * 60)
     print()
-    print("  You're ready to use VerifyBot. Try:")
+    print("  You're ready to use agent. Try:")
     print()
     print('    python main.py "write a hello world script"')
     print('    python main.py "make a random number generator" --target raspi')

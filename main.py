@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py -- VerifyBot v2: LLM-driven hardware debug loop.
+main.py -- agent: LLM-driven code & hardware debug loop.
 
 One command does everything:
     python main.py "make a random word generator that saves to a text file"
@@ -663,7 +663,7 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
     detach = is_long_running(prompt)
 
     print("=" * 60)
-    print(f"VerifyBot v2")
+    print(f"agent")
     print(f"  Target:  {resolved}")
     print(f"  Prompt:  {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
     print(f"  Retries: {max_retries}")
@@ -862,7 +862,7 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="VerifyBot v2: LLM-driven hardware debug loop",
+        description="agent: LLM-driven code & hardware debug loop",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"

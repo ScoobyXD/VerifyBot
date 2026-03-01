@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tests.py -- Parallel multi-agent test suite for VerifyBot.
+tests.py -- Parallel multi-agent test suite for agent.
 
 Runs test "streams" in parallel. Each stream gets its own browser session
 (its own ChatGPT agent) with a CLONED browser profile so multiple Chromium
@@ -61,14 +61,14 @@ TESTS = [
     # --- Stream A: file create + delete (sequential dependency) ---
     {
         "name": "Simple file creation",
-        "prompt": "make me a test folder called verifybot_test inside my directory, "
-                  "and put a file called hello.txt inside it that says 'VerifyBot works!'",
+        "prompt": "make me a test folder called agent_test inside my directory, "
+                  "and put a file called hello.txt inside it that says 'agent works!'",
         "target": "local",
         "stream": "A",
     },
     {
         "name": "Cleanup test folder",
-        "prompt": "Delete the folder called verifybot_test in my directory and everything "
+        "prompt": "Delete the folder called agent_test in my directory and everything "
                   "inside it. Confirm it no longer exists after deletion.",
         "target": "local",
         "stream": "A",
@@ -169,7 +169,7 @@ def init_test_md():
     RAW_MD_DIR.mkdir(exist_ok=True)
     with _md_lock:
         TEST_MD.write_text(
-            f"# VerifyBot Test Results\n"
+            f"# Agent Test Results\n"
             f"_Generated: {datetime.now().isoformat()}_\n\n"
             f"---\n\n",
             encoding="utf-8",
@@ -426,7 +426,7 @@ def run_tests(test_indices: list = None, target_override: str = None,
     # Console banner
     print()
     print("=" * 60)
-    print("  VERIFYBOT PARALLEL TEST SUITE")
+    print("  AGENT PARALLEL TEST SUITE")
     print("=" * 60)
     print(f"  Tests:    {len(tests_to_run)}")
     print(f"  Streams:  {len(streams)} ({', '.join(stream_ids)})")
@@ -577,7 +577,7 @@ def run_tests(test_indices: list = None, target_override: str = None,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="VerifyBot Parallel Test Suite -- multi-agent swarm testing",
+        description="Agent Parallel Test Suite -- multi-agent swarm testing",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"

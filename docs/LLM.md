@@ -1,31 +1,31 @@
-# VerifyBot v2 -- LLM-Driven Hardware Debug Loop
+# agent -- LLM-Driven Code & Hardware Debug Loop
 
 ## What This Is
 
-A Python tool that automates the copy-paste debugging cycle between an LLM (ChatGPT) and real hardware (Raspberry Pi 5, local machine). Instead of you manually copying terminal errors, pasting them into ChatGPT, copying the fix, and running it -- VerifyBot does the whole loop automatically.
+A Python tool that automates the copy-paste debugging cycle between an LLM (ChatGPT) and real hardware (Raspberry Pi 5, local machine). Instead of you manually copying terminal errors, pasting them into ChatGPT, copying the fix, and running it -- agent does the whole loop automatically.
 
-The LLM is the brain. VerifyBot is just hands on the keyboard.
+The LLM is the brain. agent is just hands on the keyboard.
 
 ## How To Use (New User Guide)
 
 ### Quick Start
 
-1. **Get the code**: Download or clone the VerifyBot folder onto your computer.
+1. **Get the code**: Download or clone the agent folder onto your computer.
 
 2. **Make sure you have Python 3.10+**: Open a terminal and run `python --version`. If you don't have Python, install it from https://python.org.
 
-3. **Run it**: Open a terminal in the VerifyBot folder and type:
+3. **Run it**: Open a terminal in the agent folder and type:
    ```bash
    python main.py "hello"
    ```
    On your very first run, a setup wizard will automatically walk you through everything:
    - Installing dependencies (playwright, paramiko)
-   - Installing the Chromium browser that VerifyBot uses
+   - Installing the Chromium browser that agent uses
    - Setting up Raspberry Pi SSH credentials (optional -- skip if you don't have one)
    - Logging into ChatGPT through a browser window (your session gets saved)
-   - Creating all the folders VerifyBot needs
+   - Creating all the folders agent needs
 
-4. **That's it.** After setup finishes, you can start using VerifyBot normally:
+4. **That's it.** After setup finishes, you can start using agent normally:
    ```bash
    python main.py "write a script that prints the first 20 prime numbers"
    python main.py "make a random word generator" --target raspi
@@ -41,7 +41,7 @@ The LLM is the brain. VerifyBot is just hands on the keyboard.
 ### What You Do NOT Need
 
 - You do NOT need a `.browser_profile/` folder from someone else. The setup wizard creates your own.
-- You do NOT need an OpenAI API key. VerifyBot uses the free ChatGPT browser interface, not the API.
+- You do NOT need an OpenAI API key. agent uses the free ChatGPT browser interface, not the API.
 - You do NOT need to install anything manually. The setup wizard handles pip packages, Playwright, and Chromium.
 
 ### After Setup
@@ -77,7 +77,7 @@ python main.py "make a random word generator that saves to a text file"
 ## Directory Structure
 
 ```
-verifybot/
+agent/
 ├── main.py                    # Entry point -- the entire pipeline
 ├── tests.py              # End-to-end test suite (runs prompts through full pipeline)
 ├── core/
@@ -143,11 +143,11 @@ tests.py
 
 ## Key Design Decisions
 
-### The LLM is the brain, VerifyBot is the tool
-VerifyBot does NOT try to diagnose errors, pick strategies, or add intelligence. It captures output faithfully and sends it back to the LLM. As LLMs improve, the tool gets better for free. Hardcoding heuristics is a losing game.
+### The LLM is the brain, agent is the tool
+agent does NOT try to diagnose errors, pick strategies, or add intelligence. It captures output faithfully and sends it back to the LLM. As LLMs improve, the tool gets better for free. Hardcoding heuristics is a losing game.
 
 ### LLM verifies output, not exit codes
-After executing code, VerifyBot sends the full stdout/stderr back to ChatGPT and asks: "Does this correctly complete the task?" The LLM responds PASS, FAIL (with fix), or REVISE (with changes). This means even a program that exits 0 but produces wrong output gets caught. VerifyBot never decides success or failure — the LLM does.
+After executing code, agent sends the full stdout/stderr back to ChatGPT and asks: "Does this correctly complete the task?" The LLM responds PASS, FAIL (with fix), or REVISE (with changes). This means even a program that exits 0 but produces wrong output gets caught. agent never decides success or failure — the LLM does.
 
 ### Versioned programs and outputs — never overwrite
 Every attempt saves files with `_1`, `_2`, `_3` suffixes. `programs/prime_gen_1.py` is attempt 1, `programs/prime_gen_2.py` is the fix. `outputs/prime_gen_1.txt` has the stdout/stderr from attempt 1. You always have full history to see what changed between versions. Duplicate scripts (identical code across prompts) are automatically detected and skipped.
@@ -159,16 +159,16 @@ The `raw_md/` transcript files embed saved scripts and execution outputs inline 
 Each interaction with the LLM in a pipeline run is called a "Prompt" (Prompt 1, Prompt 2, etc.) in all logs and output files. Prompt 1 is the initial request, subsequent prompts are verification/retry cycles.
 
 ### Context injection at startup
-Before the first prompt, VerifyBot SSHs into the Pi and gathers: hostname, kernel, Python version, pip packages, working directory contents, disk/memory, running processes, I2C/GPIO/serial state. This is saved to `context/raspi.md` and injected into the initial prompt. On each new chat, the probe runs again and picks up any changes the previous session made. For local targets, context includes the git branch, bash availability, and installed compilers.
+Before the first prompt, agent SSHs into the Pi and gathers: hostname, kernel, Python version, pip packages, working directory contents, disk/memory, running processes, I2C/GPIO/serial state. This is saved to `context/raspi.md` and injected into the initial prompt. On each new chat, the probe runs again and picks up any changes the previous session made. For local targets, context includes the git branch, bash availability, and installed compilers.
 
 ### Prompt engineering for reliable extraction
 The initial prompt tells the LLM to put ALL code in exactly ONE fenced code block, and to put NO text after the closing fence. This prevents ChatGPT's usage instructions ("Save as...", "How to run...") from leaking into the extracted code. The prompt also stresses simplicity: fewer lines = fewer bugs.
 
 ### LLM-predicted timeouts
-The LLM is prompted to include `TIMEOUT: <seconds>` when it knows a script needs longer than the default 30s. VerifyBot reads this and adjusts the execution timeout. This solves the false-negative problem where long-running scripts get killed prematurely.
+The LLM is prompted to include `TIMEOUT: <seconds>` when it knows a script needs longer than the default 30s. agent reads this and adjusts the execution timeout. This solves the false-negative problem where long-running scripts get killed prematurely.
 
 ### No mode detection -- just execute what you get
-The old system had separate "terminal loop" and "file pipeline" modes with regex-based routing. v2 removes this: the LLM responds with scripts, bash commands, or both. VerifyBot extracts and executes whatever it gets, in order. No upfront mode decision needed.
+The old system had separate "terminal loop" and "file pipeline" modes with regex-based routing. v2 removes this: the LLM responds with scripts, bash commands, or both. agent extracts and executes whatever it gets, in order. No upfront mode decision needed.
 
 ### Local target = Python only
 When target is `local`, the LLM is told to ALWAYS write Python. Even for simple tasks like creating folders, running git commands, or moving files -- the LLM uses `subprocess.run()`, `os`, `shutil`, and `pathlib` instead of bash. This eliminates all bash-on-Windows problems (WSL path mangling, Git Bash detection, cmd.exe incompatibilities). If the LLM writes a `.sh` script anyway, `run_script_local` returns a clear error telling it to rewrite in Python. The Raspberry Pi target still supports bash, Python, and C/C++ since it's native Linux over SSH.
@@ -251,7 +251,7 @@ playwright install chromium
 5. Context files in `context/` are auto-generated. Do not manually edit.
 6. The `programs/` directory keeps ALL versions. Files are named `slug_1.py`, `slug_2.py`, etc.
 7. The `outputs/` directory keeps ALL execution outputs. Same versioning scheme.
-8. `raw_md/` contains full pipeline transcripts for debugging VerifyBot itself.
+8. `raw_md/` contains full pipeline transcripts for debugging agent itself.
 9. **Dotfiles lose their leading dot when downloaded from Claude.ai.** After downloading, rename `gitignore` to `.gitignore` and `env` to `.env`. This is a browser download artifact, not a bug in the code.
 10. **Pycache auto-cleanup.** `main.py` deletes all `__pycache__/` directories on startup. You do NOT need to manually delete them when updating files.
 11. **Browser login persistence.** ChatGPT cookies are saved in `.browser_profile/`. Run `python main.py --login` once to log in manually. If the browser opens without being logged in, your `.browser_profile/` directory may have been deleted or moved -- run `--login` again. Do NOT delete `.browser_profile/` unless you want to re-login.
