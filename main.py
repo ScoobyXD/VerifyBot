@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -50,7 +51,7 @@ from skills.chatgpt_skill import save_response, append_to_log
 from skills.ssh_skill import ssh_run, ssh_run_live, ssh_run_detached, sftp_upload, REMOTE_WORK_DIR
 from skills.extract_skill import (
     extract_blocks, extract_filename_hint, extract_timeout_hint,
-    classify_blocks, CodeBlock,
+    extract_observe_hint, classify_blocks, CodeBlock,
 )
 
 # ---------------------------------------------------------------------------
@@ -201,6 +202,20 @@ def build_initial_prompt(user_prompt: str, context: str, target: str,
         f"- If you need multiple files or steps, combine them into ONE script.\n"
         f"- If you need a package installed, include INSTALL: package1, package2 BEFORE the code block.\n"
         f"- If this will take longer than 30s to run, include TIMEOUT: <seconds> BEFORE the code block.\n"
+        f"- If this launches long-running processes (dev servers, build tools, background services),\n"
+        f"  include OBSERVE: <seconds> BEFORE the code block. My runner will stream the real terminal\n"
+        f"  output for that many seconds and send it back to you for verification.\n"
+        f"\n"
+        f"=== OBSERVE MODE (for dev servers, builds, long-running processes) ===\n"
+        f"When you include OBSERVE: N, my runner watches stdout/stderr for N seconds.\n"
+        f"CRITICAL RULES for observed scripts:\n"
+        f"- Spawn child processes using subprocess.Popen() with NO special flags.\n"
+        f"- Do NOT use CREATE_NEW_CONSOLE, DETACHED_PROCESS, or shell=True.\n"
+        f"- Do NOT open new terminal windows. All output must flow through stdout/stderr pipes.\n"
+        f"- The script must NOT call sys.exit() or exit early -- it should stay alive so child output keeps flowing.\n"
+        f"- Use subprocess.Popen(cmd, stdout=None, stderr=None) to let children inherit the parent's pipes.\n"
+        f"- If spawning multiple processes, spawn them all and then wait (e.g. while loop with sleep).\n"
+        f"- I will capture ALL output that flows through these pipes for N seconds and send it to you.\n"
         f"\n"
         f"=== RULES ===\n"
         f"- SIMPLICITY FIRST: prefer the simplest, most direct solution. Fewer lines = fewer bugs.\n"
@@ -229,17 +244,27 @@ def build_verification_prompt(executed: list[dict], original_task: str) -> str:
         lines.append(f"Exit code: {item['exit_code']}")
         if item.get("timed_out"):
             lines.append(f"(Timed out after {item.get('timeout', '?')}s)")
+        if item.get("observed"):
+            lines.append(f"(OBSERVED MODE: watched real terminal output for {item.get('observe_seconds', '?')}s)")
+            if item.get("still_running"):
+                lines.append(f"(Process is STILL RUNNING after observation window)")
+            lines.append("")
+            lines.append("=== REAL TERMINAL OUTPUT (stdout) ===")
+            lines.append("This is the actual output from the process and all its children,")
+            lines.append("captured in real-time during the observation window:")
         if item.get("stdout"):
-            lines.append(f"STDOUT:\n{item['stdout'][:3000]}")
+            lines.append(f"STDOUT:\n{item['stdout'][:5000]}")
         if item.get("stderr"):
-            lines.append(f"STDERR:\n{item['stderr'][:2000]}")
+            lines.append(f"STDERR:\n{item['stderr'][:3000]}")
         lines.append("")
 
     lines.append(
         "Based on the output above, does this correctly complete the task?\n"
+        "IMPORTANT: Look at the ACTUAL terminal output, not just status messages from the launcher script.\n"
+        "Check for: compilation errors, runtime errors, missing files, failed builds, npm errors, etc.\n"
         "Respond with exactly one of:\n"
-        "- PASS: if the task is complete and the output is correct\n"
-        "- FAIL: if there are errors, and then provide the complete fixed code\n"
+        "- PASS: if the task is complete and the output shows success\n"
+        "- FAIL: if there are errors in the output, and then provide the complete fixed code\n"
         "- REVISE: if it partially works but needs changes, and then provide the complete revised code"
     )
 
@@ -518,8 +543,154 @@ def _compile_and_run_local(filepath: Path, timeout: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Output helpers
+# Observed execution (streaming child process output)
 # ---------------------------------------------------------------------------
+
+def run_script_local_observed(filepath: Path, timeout: int = 30,
+                              observe_seconds: int = 60) -> dict:
+    """Run a script locally AND observe its child processes' output over time.
+
+    Unlike run_script_local which uses subprocess.run() (waits for exit,
+    captures final output), this function:
+      1. Launches the script with Popen and pipes
+      2. Streams stdout/stderr in real-time for `observe_seconds`
+      3. Accumulates ALL output (parent + child process output visible on pipes)
+      4. After the observation window, returns the accumulated output
+      5. Leaves the process running if it's still alive (e.g. dev servers)
+
+    The key insight: if the LLM writes a script that spawns child processes
+    using subprocess.Popen (with inherited pipes, not CREATE_NEW_CONSOLE),
+    we can capture their output through the parent's pipes.
+
+    Returns the same dict format as run_script_local, plus:
+      - 'observed': True
+      - 'observe_seconds': how long we watched
+      - 'still_running': True if process was still alive after observation
+    """
+    ext = filepath.suffix.lower()
+
+    if ext == ".py":
+        cmd = [sys.executable, "-u", str(filepath)]
+    else:
+        return {"name": filepath.name, "success": False, "exit_code": -1,
+                "stdout": "",
+                "stderr": f"[ERROR] Observed execution only supports Python (.py).",
+                "timed_out": False, "observed": True}
+
+    sep = "─" * 60
+
+    # --- Show the script code ---
+    print(f"\n  ┌{sep}")
+    print(f"  │ SCRIPT: {filepath.name}")
+    print(f"  │ MODE: OBSERVED (watching output for {observe_seconds}s)")
+    print(f"  ├{sep}")
+    try:
+        code_lines = filepath.read_text(encoding="utf-8").split("\n")
+        for i, line in enumerate(code_lines, 1):
+            print(f"  │ {i:3d} │ {line}")
+    except Exception:
+        print(f"  │ (could not read file)")
+    print(f"  ├{sep}")
+    print(f"  │ EXECUTING: {' '.join(cmd)}")
+    print(f"  │ OBSERVING: streaming output for up to {observe_seconds}s...")
+    print(f"  ├{sep}")
+
+    # --- Launch with Popen and stream output ---
+    out_lines = []
+    err_lines = []
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,  # line-buffered
+            cwd=ROOT,
+        )
+    except Exception as e:
+        print(f"  │ \033[91m[ERROR] Failed to start: {e}\033[0m")
+        print(f"  └{sep} \033[91mLAUNCH FAILED\033[0m")
+        return {"name": filepath.name, "success": False, "exit_code": -1,
+                "stdout": "", "stderr": str(e), "timed_out": False,
+                "observed": True}
+
+    def _read_stream(stream, buf, label):
+        """Read lines from a stream in a background thread."""
+        try:
+            for line in iter(stream.readline, ""):
+                if not line:
+                    break
+                clean = line.rstrip("\r\n")
+                buf.append(line)
+                if clean:
+                    color = "" if label == "out" else "\033[91m"
+                    reset = "\033[0m" if color else ""
+                    print(f"  │ {color}{clean}{reset}")
+        except (ValueError, OSError):
+            pass  # stream closed
+
+    # Start reader threads
+    t_out = threading.Thread(target=_read_stream, args=(proc.stdout, out_lines, "out"), daemon=True)
+    t_err = threading.Thread(target=_read_stream, args=(proc.stderr, err_lines, "err"), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    # Wait for either the process to exit or the observation window to expire
+    deadline = time.time() + observe_seconds
+    script_exited = False
+    exit_code = None
+
+    while time.time() < deadline:
+        rc = proc.poll()
+        if rc is not None:
+            # Script exited on its own
+            script_exited = True
+            exit_code = rc
+            # Give readers a moment to flush remaining output
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+            break
+        time.sleep(0.5)
+
+    still_running = not script_exited
+
+    if still_running:
+        # Observation window expired, process still running
+        # Don't kill it (might be a dev server the user wants)
+        # But do try to grab any remaining buffered output
+        exit_code = -1
+        print(f"  │")
+        print(f"  │ \033[93m[OBSERVE] {observe_seconds}s observation window ended, process still running\033[0m")
+        print(f"  │ \033[93m[OBSERVE] Leaving process alive (PID {proc.pid})\033[0m")
+
+    stdout_text = "".join(out_lines)
+    stderr_text = "".join(err_lines)
+
+    # --- Summary ---
+    if not stdout_text and not stderr_text:
+        print(f"  │ (no output during observation window)")
+
+    if script_exited:
+        status_str = "OK" if exit_code == 0 else f"EXIT {exit_code}"
+        color = "\033[92m" if exit_code == 0 else "\033[91m"
+    else:
+        status_str = f"STILL RUNNING (observed {observe_seconds}s)"
+        color = "\033[93m"
+    print(f"  └{sep} {color}{status_str}\033[0m")
+
+    return {
+        "name": filepath.name,
+        "success": (exit_code == 0) if script_exited else False,
+        "exit_code": exit_code if exit_code is not None else -1,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+        "timed_out": False,
+        "observed": True,
+        "observe_seconds": observe_seconds,
+        "still_running": still_running,
+        "pid": proc.pid,
+    }
 
 def _print_output(r: dict):
     """Print SSH result output."""
@@ -557,6 +728,38 @@ def is_long_running(prompt: str) -> bool:
     if any(re.search(pat, p) for pat in KILL_PATTERNS):
         return False
     return any(re.search(pat, p) for pat in LONG_PATTERNS)
+
+
+# Patterns in script SOURCE CODE that suggest it spawns long-lived children
+# and needs observed execution even if the LLM forgot OBSERVE:
+_OBSERVE_CODE_PATTERNS = [
+    r"subprocess\.Popen",          # spawns child processes
+    r"CREATE_NEW_CONSOLE",         # opens separate windows
+    r"DETACHED_PROCESS",           # detached subprocess
+    r"npm\s+run\b",               # npm dev servers / builds
+    r"tauri\s+dev\b",             # tauri dev server
+    r"cargo\s+run\b",            # rust dev builds
+    r"convex\s+dev\b",           # convex dev server
+    r"vite\b",                    # vite dev server
+    r"next\s+dev\b",             # next.js dev
+    r"webpack\b.*serve\b",       # webpack dev server
+    r"flask\s+run\b",            # flask dev server
+    r"uvicorn\b",                # python ASGI server
+    r"gunicorn\b",               # python WSGI server
+    r"docker\s+compose\s+up\b",  # docker compose
+]
+
+# Default observation window when auto-detected (seconds)
+_AUTO_OBSERVE_SECONDS = 90
+
+
+def needs_observation(script_code: str) -> bool:
+    """Check if a script's source code suggests it spawns long-lived processes
+    that need observed execution."""
+    for pat in _OBSERVE_CODE_PATTERNS:
+        if re.search(pat, script_code, re.IGNORECASE):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -775,6 +978,11 @@ def _run_pipeline_inner(session, initial_prompt, prompt, resolved,
         if timeout_hint:
             print(f"  [TIMEOUT] LLM says {timeout_hint}s needed")
 
+        # Check for observe hint from LLM (for long-running processes)
+        observe_hint = extract_observe_hint(response)
+        if observe_hint:
+            print(f"  [OBSERVE] LLM says observe output for {observe_hint}s")
+
         # Step 4: Extract code
         print(f"\n[3] Extracting code from response...")
         blocks = extract_blocks(response)
@@ -839,9 +1047,19 @@ def _run_pipeline_inner(session, initial_prompt, prompt, resolved,
                 append_to_log(md_path, f"Saved Script: {fp.name} (Prompt {attempt})",
                               f"```{block.language}\n{block.code}\n```")
 
+                # Determine execution mode
+                effective_observe = observe_hint
+                if not effective_observe and needs_observation(block.code):
+                    effective_observe = _AUTO_OBSERVE_SECONDS
+                    print(f"  [AUTO-OBSERVE] Script spawns child processes, "
+                          f"auto-enabling observation for {effective_observe}s")
+
                 if resolved == "raspi":
                     result = run_script_on_pi(fp, remote_dir or REMOTE_WORK_DIR,
                                               timeout=run_timeout, detach=detach)
+                elif effective_observe:
+                    result = run_script_local_observed(
+                        fp, timeout=run_timeout, observe_seconds=effective_observe)
                 else:
                     result = run_script_local(fp, timeout=run_timeout)
                 all_results.append(result)
@@ -974,6 +1192,11 @@ def run_followup_pipeline(session, followup_prompt: str, md_path=None,
         if timeout_hint:
             print(f"  [TIMEOUT] LLM says {timeout_hint}s needed")
 
+        # Observe hint (for long-running processes)
+        observe_hint = extract_observe_hint(response)
+        if observe_hint:
+            print(f"  [OBSERVE] LLM says observe output for {observe_hint}s")
+
         # Extract code
         print(f"\n[3] Extracting code from response...")
         blocks = extract_blocks(response)
@@ -1033,9 +1256,19 @@ def run_followup_pipeline(session, followup_prompt: str, md_path=None,
                     append_to_log(md_path, f"Saved Script: {fp.name} (Follow-up {attempt})",
                                   f"```{block.language}\n{block.code}\n```")
 
+                # Determine execution mode
+                effective_observe = observe_hint
+                if not effective_observe and needs_observation(block.code):
+                    effective_observe = _AUTO_OBSERVE_SECONDS
+                    print(f"  [AUTO-OBSERVE] Script spawns child processes, "
+                          f"auto-enabling observation for {effective_observe}s")
+
                 if resolved == "raspi":
                     result = run_script_on_pi(fp, remote_dir or REMOTE_WORK_DIR,
                                               timeout=run_timeout, detach=detach)
+                elif effective_observe:
+                    result = run_script_local_observed(
+                        fp, timeout=run_timeout, observe_seconds=effective_observe)
                 else:
                     result = run_script_local(fp, timeout=run_timeout)
                 all_results.append(result)

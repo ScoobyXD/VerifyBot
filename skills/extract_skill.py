@@ -522,6 +522,21 @@ def extract_timeout_hint(text: str) -> Optional[int]:
     return None
 
 
+def extract_observe_hint(text: str) -> Optional[int]:
+    """Parse OBSERVE: <seconds> from the top of an LLM response.
+
+    When the LLM includes OBSERVE: N, the runner will keep the script's
+    child processes alive for N seconds, streaming their stdout/stderr,
+    and accumulate the real terminal output for verification.
+    """
+    m = re.search(r"OBSERVE:\s*(\d+)", text[:500])
+    if m:
+        val = int(m.group(1))
+        if 5 <= val <= 600:
+            return val
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Classification: script vs command
 # ---------------------------------------------------------------------------
