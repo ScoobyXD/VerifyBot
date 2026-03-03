@@ -416,13 +416,16 @@ def on_run_agent(data):
             except Exception:
                 pass
 
-            # Store session info (with queue and md_path) for follow-ups
+            # Store session info (with queue, md_path, and target) for follow-ups
             with _agent_sessions_lock:
                 _agent_sessions[agent_id] = {
                     "session": session,
                     "sid": sid,
                     "queue": agent_queue,
                     "md_path": md_path,
+                    "target": target if target != "auto" else None,
+                    "timeout": timeout,
+                    "max_retries": max_retries,
                 }
 
             socketio.emit("agent_done", {"agent_id": agent_id, "success": result}, to=sid)
@@ -460,19 +463,37 @@ def on_run_agent(data):
                     socketio.emit("agent_running", {"agent_id": agent_id}, to=sid)
 
                     try:
-                        print(f"\n[FOLLOWUP] Sending to ChatGPT ({len(fu_prompt)} chars)...")
-                        response = session.followup(fu_prompt, files=fu_files if fu_files else None)
-                        _take_screenshot(session)
-                        print(f"[OK] Follow-up response received ({len(response)} chars)")
+                        from main import run_followup_pipeline
 
-                        # Append to raw_md log for continuity
-                        if md_path:
-                            append_to_log(md_path, "Follow-up Prompt", fu_prompt)
-                            append_to_log(md_path, "Follow-up Response", response)
+                        # Resolve target from initial pipeline config
+                        fu_target = None
+                        fu_timeout = timeout
+                        fu_retries = max_retries
+                        with _agent_sessions_lock:
+                            si = _agent_sessions.get(agent_id)
+                            if si:
+                                fu_target = si.get("target")
+                                fu_timeout = si.get("timeout", timeout)
+                                fu_retries = si.get("max_retries", max_retries)
 
-                        socketio.emit("agent_done", {"agent_id": agent_id, "success": True}, to=sid)
+                        fu_result = run_followup_pipeline(
+                            session=session,
+                            followup_prompt=fu_prompt,
+                            md_path=md_path,
+                            target=fu_target,
+                            max_retries=fu_retries,
+                            timeout=fu_timeout,
+                            file_paths=fu_files if fu_files else None,
+                        )
+
+                        socketio.emit("agent_done", {
+                            "agent_id": agent_id,
+                            "success": fu_result,
+                        }, to=sid)
                     except Exception as e:
-                        print(f"[ERROR] Follow-up failed: {e}")
+                        print(f"[ERROR] Follow-up pipeline failed: {e}")
+                        import traceback
+                        traceback.print_exc()
                         socketio.emit("agent_error", {"agent_id": agent_id, "error": str(e)}, to=sid)
                     finally:
                         sys.stdout = old_out

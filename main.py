@@ -895,6 +895,197 @@ def _run_pipeline_inner(session, initial_prompt, prompt, resolved,
     return False
 
 
+def run_followup_pipeline(session, followup_prompt: str, md_path=None,
+                          target: str = "local", max_retries: int = 3,
+                          timeout: int = 30, remote_dir: str = None,
+                          file_paths: list = None) -> bool:
+    """Run the extract → execute → verify loop on a follow-up prompt.
+
+    This is for the workbench UI: after the initial pipeline finishes, the
+    user can send follow-up prompts in the same ChatGPT session. Each
+    follow-up goes through the full pipeline loop (extract code, execute,
+    verify) just like the initial prompt, but uses session.followup()
+    instead of session.prompt().
+
+    Args:
+        session: An already-open ChatGPTSession (same conversation).
+        followup_prompt: The user's new prompt text.
+        md_path: Path to the raw_md log to append to (or None).
+        target: 'local' or 'raspi'.
+        max_retries: Max retry attempts for this follow-up.
+        timeout: Default execution timeout.
+        remote_dir: Working directory on Pi.
+        file_paths: Optional file paths to attach.
+
+    Returns True if the LLM verified PASS, False otherwise.
+    """
+    resolved = target or "local"
+    detach = is_long_running(followup_prompt)
+
+    print("=" * 60)
+    print(f"Follow-up Pipeline")
+    print(f"  Target:  {resolved}")
+    print(f"  Prompt:  {followup_prompt[:80]}{'...' if len(followup_prompt) > 80 else ''}")
+    print(f"  Retries: {max_retries}")
+    print("=" * 60)
+
+    _saved_code_hashes = set()
+
+    # The first prompt in the follow-up is the user's new prompt.
+    # Subsequent prompts are verification/retry follow-ups.
+    current_prompt = followup_prompt
+    is_first = True
+
+    for attempt in range(1, max_retries + 2):
+        print(f"\n{'='*60}")
+        label = "FOLLOWUP" if is_first else f"RETRY {attempt - 1}"
+        print(f"[{label}]")
+        print(f"{'='*60}")
+
+        if md_path:
+            append_to_log(md_path, f"Follow-up Prompt (Attempt {attempt})",
+                          f"```\n{current_prompt}\n```")
+
+        print(f"\n[2] Sending to ChatGPT ({len(current_prompt)} chars)...")
+        if is_first and file_paths:
+            response = session.followup(current_prompt, files=file_paths)
+        else:
+            response = session.followup(current_prompt)
+        is_first = False
+
+        if md_path:
+            append_to_log(md_path, f"Follow-up Response (Attempt {attempt})", response)
+
+        # Check for PASS
+        response_stripped = response.strip()
+        if response_stripped.upper().startswith("PASS"):
+            print(f"\n[DONE] LLM verified: PASS")
+            if md_path:
+                append_to_log(md_path, f"Follow-up Attempt {attempt} Result",
+                              "LLM VERIFIED: PASS")
+            return True
+
+        # Handle installs
+        handle_installs(response, resolved)
+
+        # Timeout hint
+        timeout_hint = extract_timeout_hint(response)
+        run_timeout = timeout_hint or timeout
+        if timeout_hint:
+            print(f"  [TIMEOUT] LLM says {timeout_hint}s needed")
+
+        # Extract code
+        print(f"\n[3] Extracting code from response...")
+        blocks = extract_blocks(response)
+        if not blocks:
+            print("  [WARN] No code blocks found in follow-up response.")
+            if md_path:
+                append_to_log(md_path, f"Follow-up Attempt {attempt}",
+                              "No code blocks found.")
+            # If the LLM just gave a text answer with no code, that's fine —
+            # it may be answering a question. Don't retry, just return.
+            print("  [INFO] LLM responded without code (may be a text answer).")
+            return True
+
+        scripts, commands = classify_blocks(blocks)
+        print(f"  Found: {len(scripts)} script(s), {len(commands)} command(s)")
+
+        # Deduplicate
+        if scripts:
+            unique_scripts = []
+            for block in scripts:
+                code_hash = hash(block.code.strip())
+                if code_hash in _saved_code_hashes:
+                    print(f"  [SKIP] Duplicate script detected, skipping.")
+                else:
+                    unique_scripts.append(block)
+                    _saved_code_hashes.add(code_hash)
+            scripts = unique_scripts
+
+        if not scripts and not commands:
+            print("  [WARN] No executable code after classification.")
+            current_prompt = (
+                "Your response contained code but none were executable "
+                "scripts or commands. Please provide a complete script."
+            )
+            continue
+
+        # Execute
+        print(f"\n[4] Executing on {resolved}...")
+        all_results = []
+        pre_snap = snapshot_dirs()
+
+        if commands:
+            if resolved == "raspi":
+                cmd_results = run_commands_on_pi(commands, timeout=15)
+                all_results.extend(cmd_results)
+            else:
+                print(f"  [SKIP] {len(commands)} shell command(s) -- local runs Python only")
+
+        if scripts:
+            saved_files = []
+            for i, block in enumerate(scripts):
+                fp = save_script(block, followup_prompt, response, i, len(scripts), attempt)
+                saved_files.append((fp, block))
+
+            for fp, block in saved_files:
+                if md_path:
+                    append_to_log(md_path, f"Saved Script: {fp.name} (Follow-up {attempt})",
+                                  f"```{block.language}\n{block.code}\n```")
+
+                if resolved == "raspi":
+                    result = run_script_on_pi(fp, remote_dir or REMOTE_WORK_DIR,
+                                              timeout=run_timeout, detach=detach)
+                else:
+                    result = run_script_local(fp, timeout=run_timeout)
+                all_results.append(result)
+
+        executed = [r for r in all_results if not r.get("skipped")]
+        for r in executed:
+            out_path = save_output(r.get("name", "output"), r.get("stdout", ""),
+                                   r.get("stderr", ""), attempt)
+            if md_path:
+                out_content = ""
+                if r.get("stdout"):
+                    out_content += f"STDOUT:\n```\n{r['stdout'][:3000]}\n```\n"
+                if r.get("stderr"):
+                    out_content += f"STDERR:\n```\n{r['stderr'][:2000]}\n```\n"
+                if not out_content:
+                    out_content = "(no output)\n"
+                append_to_log(md_path, f"Output: {out_path.name} (Follow-up {attempt})",
+                              out_content)
+
+        if not executed:
+            print("\n  [WARN] Nothing executed.")
+            current_prompt = "None of the code was executable. Please provide a runnable Python script."
+            continue
+
+        if resolved == "local":
+            sweep_artifacts(pre_snap)
+
+        # Log execution summary
+        exec_log = ""
+        for r in executed:
+            exec_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
+            if r.get("timed_out"):
+                exec_log += f"(Timed out after {r.get('timeout', '?')}s)\n"
+        if md_path:
+            append_to_log(md_path, f"Follow-up {attempt} Execution Summary", exec_log)
+
+        # Verify
+        if attempt > max_retries:
+            print(f"\n[FAIL] Max retries ({max_retries}) reached.")
+            if md_path:
+                append_to_log(md_path, "Follow-up Final Result",
+                              f"FAILED after {max_retries} retries.")
+            return False
+
+        print(f"\n[5] Asking ChatGPT to verify output...")
+        current_prompt = build_verification_prompt(executed, followup_prompt)
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
