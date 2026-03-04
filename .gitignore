@@ -9,3 +9,4 @@ uploads/
 context/
 __pycache__/
 *.pyc
+.browser_profiles/

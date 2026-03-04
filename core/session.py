@@ -124,6 +124,21 @@ class ChatGPTSession:
         self._in_conversation = False
         print("[OK] New chat started.")
 
+    def switch_model(self, model_key: str):
+        """Switch to a different model and start a new conversation.
+
+        Reuses the same browser context (no new Playwright instance).
+        Navigates to a new chat URL with the target model parameter.
+
+        Args:
+            model_key: Model name from selectors.MODELS ('instant', 'thinking', 'auto').
+        """
+        old_model = self._model
+        self._model = model_key
+        self._navigate_to_new_chat()
+        self._in_conversation = False
+        print(f"[OK] Switched model: {old_model} -> {model_key}")
+
     # --- Internals ---
 
     def _attach_files(self, file_paths: list):

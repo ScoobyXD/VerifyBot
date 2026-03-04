@@ -349,6 +349,50 @@ def api_agent_files(agent_id, folder):
                 })
     return jsonify(files[:50])
 
+@app.route("/api/git_push", methods=["POST"])
+def api_git_push():
+    """Run git add, commit, push. Returns stdout/stderr for the agent to process."""
+    data = request.get_json(silent=True) or {}
+    message = data.get("message", "Auto-commit from VerifyBot")
+
+    results = []
+    # Step 1: git add -A
+    try:
+        r = subprocess.run(["git", "add", "-A"], capture_output=True, text=True,
+                           timeout=15, cwd=str(ROOT))
+        results.append({"cmd": "git add -A", "exit": r.returncode,
+                        "stdout": r.stdout, "stderr": r.stderr})
+    except Exception as e:
+        results.append({"cmd": "git add -A", "exit": -1, "stdout": "", "stderr": str(e)})
+
+    # Step 2: git commit
+    try:
+        r = subprocess.run(["git", "commit", "-m", message], capture_output=True,
+                           text=True, timeout=15, cwd=str(ROOT))
+        results.append({"cmd": f"git commit -m \"{message}\"", "exit": r.returncode,
+                        "stdout": r.stdout, "stderr": r.stderr})
+    except Exception as e:
+        results.append({"cmd": "git commit", "exit": -1, "stdout": "", "stderr": str(e)})
+
+    # Step 3: git push
+    try:
+        r = subprocess.run(["git", "push"], capture_output=True, text=True,
+                           timeout=30, cwd=str(ROOT))
+        results.append({"cmd": "git push", "exit": r.returncode,
+                        "stdout": r.stdout, "stderr": r.stderr})
+    except Exception as e:
+        results.append({"cmd": "git push", "exit": -1, "stdout": "", "stderr": str(e)})
+
+    all_ok = all(r["exit"] == 0 for r in results)
+    # "nothing to commit" is still a success
+    if not all_ok:
+        for r in results:
+            if r["exit"] != 0 and "nothing to commit" in (r["stdout"] + r["stderr"]):
+                r["exit"] = 0
+        all_ok = all(r["exit"] == 0 for r in results)
+
+    return jsonify({"success": all_ok, "results": results})
+
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
     UPLOADS_DIR.mkdir(exist_ok=True)
@@ -1582,6 +1626,7 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 
   <div class="sep"></div>
   <button class="tb-btn accent" onclick="runTests()">Run Tests</button>
+  <button class="tb-btn" onclick="pushToGithub()" style="border-color:#34d399;color:#34d399"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:3px"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 00-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0020 4.77 5.07 5.07 0 0019.91 1S18.73.65 16 2.48a13.38 13.38 0 00-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 005 4.77a5.44 5.44 0 00-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 009 18.13V22"/></svg>Push</button>
   <div class="sep"></div>
 
   <span class="tb-label">Target</span>
@@ -1607,6 +1652,9 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   <div class="modal">
     <div class="modal-header">
       <span id="modalTitle">File</span>
+      <button class="tb-btn" onclick="copyModalContent()" id="modalCopyBtn" style="margin-left:auto;margin-right:8px;font-size:11px;padding:3px 10px">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:3px"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>Copy All
+      </button>
       <span class="close" onclick="closeModal()">&times;</span>
     </div>
     <div class="modal-body" id="modalBody"></div>
@@ -2317,6 +2365,82 @@ async function sendPrompt() {
 }
 
 function runTests() { socket.emit('run_tests', {}); }
+
+// === PUSH TO GITHUB ===
+async function pushToGithub() {
+  // Quick commit message
+  const msg = prompt('Commit message:', 'Update from VerifyBot');
+  if (!msg) return;
+
+  // First try the simple push
+  try {
+    const res = await fetch('/api/git_push', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ message: msg }),
+    });
+    const d = await res.json();
+
+    if (d.success) {
+      showToast('Pushed to GitHub!');
+      return;
+    }
+
+    // Push failed -- build error summary and send through the agent system
+    let errorSummary = 'Git push failed. Here are the results:\n\n';
+    for (const r of d.results) {
+      errorSummary += r.cmd + ' (exit ' + r.exit + ')\n';
+      if (r.stdout) errorSummary += 'STDOUT: ' + r.stdout.trim() + '\n';
+      if (r.stderr) errorSummary += 'STDERR: ' + r.stderr.trim() + '\n';
+      errorSummary += '\n';
+    }
+
+    // Spawn an agent to fix it
+    showToast('Push failed - spawning agent to fix...');
+    const fixPrompt = 'I tried to push to GitHub but it failed. ' +
+      'Diagnose and fix the issue. Run the necessary git commands to resolve it ' +
+      '(pull, merge, rebase, set upstream, etc.) and then push successfully.\n\n' +
+      'Error details:\n' + errorSummary;
+
+    socket.emit('run_agent', {
+      prompt: fixPrompt,
+      target: 'local',
+      max_retries: 3,
+      timeout: 30,
+      headless: false,
+    });
+
+  } catch (e) {
+    showToast('Error: ' + e.message);
+  }
+}
+
+// === COPY MODAL CONTENT ===
+function copyModalContent() {
+  const body = document.getElementById('modalBody');
+  if (!body) return;
+  const text = body.textContent || body.innerText;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById('modalCopyBtn');
+    if (btn) {
+      const orig = btn.innerHTML;
+      btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2" style="vertical-align:-1px;margin-right:3px"><polyline points="20 6 9 17 4 12"/></svg>Copied!';
+      btn.style.borderColor = '#34d399';
+      btn.style.color = '#34d399';
+      setTimeout(() => { btn.innerHTML = orig; btn.style.borderColor = ''; btn.style.color = ''; }, 1500);
+    }
+  }).catch(() => {
+    // Fallback for older browsers
+    const range = document.createRange();
+    range.selectNodeContents(body);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    document.execCommand('copy');
+    sel.removeAllRanges();
+    showToast('Copied!');
+  });
+}
 
 function handleKey(e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); }

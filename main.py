@@ -940,6 +940,12 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
 
     # --- ESCALATION: if Instant failed, try Thinking model ---
     if not result and escalate and effective_model != _S.ESCALATION_MODEL:
+        # Determine which session to reuse for escalation.
+        # If an external session was passed in (UI mode), reuse it so we
+        # don't create a conflicting Playwright instance on the same thread.
+        # If we created our own session above, it's already closed (exited
+        # the `with` block), so we pass None and escalation will create one.
+        escalation_session = session  # None if CLI (already closed), live if UI
         result = _escalate_to_thinking(
             prompt=prompt,
             md_path=md_path,
@@ -949,6 +955,7 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             headed=headed,
             profile_dir=profile_dir,
             escalation_retries=max(escalation_retries, 2),
+            session=escalation_session,
         )
 
     return result
@@ -1157,16 +1164,17 @@ def _run_pipeline_inner(session, initial_prompt, prompt, resolved,
 def _escalate_to_thinking(prompt: str, md_path: Path, target: str,
                           timeout: int, remote_dir: str,
                           headed: bool, profile_dir: Path,
-                          escalation_retries: int = 2) -> bool:
+                          escalation_retries: int = 2,
+                          session: 'ChatGPTSession' = None) -> bool:
     """Escalate a failed Instant run to the Thinking model.
 
-    Opens a NEW ChatGPT session using the Thinking model. Sends it
-    the full raw_md transcript from the Instant run as context so it
-    can see every prompt, response, code, output, and error. Then
-    runs the pipeline loop for escalation_retries more attempts.
+    If an existing session is provided (UI mode), reuses it by calling
+    switch_model() -- this avoids Playwright thread conflicts. If no
+    session is provided (CLI mode), creates a new one.
 
-    This gives the slower but smarter model a complete picture of
-    what went wrong, so it can take a different approach.
+    Sends the full raw_md transcript from the Instant run as context so
+    the Thinking model can see every prompt, response, code, output, and
+    error. Then runs the pipeline loop for escalation_retries more attempts.
 
     Returns True if Thinking model achieves PASS, False otherwise.
     """
@@ -1198,8 +1206,7 @@ def _escalate_to_thinking(prompt: str, md_path: Path, target: str,
                   f"Injecting full transcript ({len(transcript)} chars) as context.\n"
                   f"Giving Thinking model {escalation_retries} attempts.")
 
-    # Build the escalation prompt: give Thinking the full context
-    # of what Instant tried and failed, plus the original task.
+    # Build the escalation prompt
     escalation_prompt = _build_escalation_prompt(prompt, transcript, target, remote_dir)
 
     # Probe target again (state may have changed during Instant attempts)
@@ -1211,176 +1218,195 @@ def _escalate_to_thinking(prompt: str, md_path: Path, target: str,
 
     detach = is_long_running(prompt)
 
-    # Open a new session with the Thinking model
-    with ChatGPTSession(headed=headed, profile_dir=profile_dir,
-                        model=_S.ESCALATION_MODEL) as sess:
+    # --- Session strategy ---
+    # If we have a live session (UI mode), reuse it by switching model.
+    # If not (CLI mode), create a new session for the Thinking model.
+    owns_session = session is None
 
-        print(f"\n[ESCALATION] Sending context + task to {_S.ESCALATION_MODEL}...")
+    if session is not None:
+        # Reuse existing session -- just switch the model and start a new chat
+        session.switch_model(_S.ESCALATION_MODEL)
+        return _run_escalation_loop(
+            session, escalation_prompt, prompt, md_path, target,
+            timeout, remote_dir, detach, escalation_retries, _S,
+        )
+    else:
+        # CLI mode: create a fresh session
+        with ChatGPTSession(headed=headed, profile_dir=profile_dir,
+                            model=_S.ESCALATION_MODEL) as sess:
+            return _run_escalation_loop(
+                sess, escalation_prompt, prompt, md_path, target,
+                timeout, remote_dir, detach, escalation_retries, _S,
+            )
 
-        # Track code hashes to avoid re-running Instant's exact same code
-        _saved_code_hashes = set()
-        current_prompt = escalation_prompt
-        is_followup = False
 
-        for attempt in range(1, escalation_retries + 2):
-            print(f"\n{'='*60}")
-            if attempt == 1:
-                print(f"[ESCALATION PROMPT 1] ({_S.ESCALATION_MODEL})")
-            elif attempt == 2:
-                print(f"[ESCALATION VERIFY 1] ({_S.ESCALATION_MODEL})")
-            else:
-                print(f"[ESCALATION RETRY {attempt - 2}] ({_S.ESCALATION_MODEL})")
-            print(f"{'='*60}")
+def _run_escalation_loop(sess, escalation_prompt, prompt, md_path, target,
+                         timeout, remote_dir, detach, escalation_retries, _S) -> bool:
+    """Inner loop for escalation attempts. Extracted so it works with
+    both reused sessions (UI) and fresh sessions (CLI)."""
 
-            append_to_log(md_path, f"Escalation Prompt {attempt} ({_S.ESCALATION_MODEL})",
-                          f"```\n{current_prompt[:2000]}{'...(truncated)' if len(current_prompt) > 2000 else ''}\n```")
+    _saved_code_hashes = set()
+    current_prompt = escalation_prompt
+    is_followup = False
 
-            # Send to ChatGPT
-            print(f"\n[2] Sending to ChatGPT ({len(current_prompt)} chars)...")
-            if is_followup:
-                response = sess.followup(current_prompt)
-            else:
-                response = sess.prompt(current_prompt)
-            is_followup = True
+    for attempt in range(1, escalation_retries + 2):
+        print(f"\n{'='*60}")
+        if attempt == 1:
+            print(f"[ESCALATION PROMPT 1] ({_S.ESCALATION_MODEL})")
+        elif attempt == 2:
+            print(f"[ESCALATION VERIFY 1] ({_S.ESCALATION_MODEL})")
+        else:
+            print(f"[ESCALATION RETRY {attempt - 2}] ({_S.ESCALATION_MODEL})")
+        print(f"{'='*60}")
 
-            append_to_log(md_path, f"Escalation Response {attempt} ({_S.ESCALATION_MODEL})",
-                          response)
+        append_to_log(md_path, f"Escalation Prompt {attempt} ({_S.ESCALATION_MODEL})",
+                      f"```\n{current_prompt[:2000]}{'...(truncated)' if len(current_prompt) > 2000 else ''}\n```")
 
-            # Check for PASS
-            response_stripped = response.strip()
-            if response_stripped.upper().startswith("PASS"):
-                print(f"\n[DONE] {_S.ESCALATION_MODEL} verified: PASS")
-                append_to_log(md_path, f"Escalation Result",
-                              f"{_S.ESCALATION_MODEL} VERIFIED: PASS")
-                print(f"\nLog: {md_path}")
-                return True
+        # Send to ChatGPT
+        print(f"\n[2] Sending to ChatGPT ({len(current_prompt)} chars)...")
+        if is_followup:
+            response = sess.followup(current_prompt)
+        else:
+            response = sess.prompt(current_prompt)
+        is_followup = True
 
-            # Handle installs
-            handle_installs(response, target)
+        append_to_log(md_path, f"Escalation Response {attempt} ({_S.ESCALATION_MODEL})",
+                      response)
 
-            # Timeout hint
-            timeout_hint = extract_timeout_hint(response)
-            run_timeout = timeout_hint or timeout
-            if timeout_hint:
-                print(f"  [TIMEOUT] LLM says {timeout_hint}s needed")
+        # Check for PASS
+        response_stripped = response.strip()
+        if response_stripped.upper().startswith("PASS"):
+            print(f"\n[DONE] {_S.ESCALATION_MODEL} verified: PASS")
+            append_to_log(md_path, f"Escalation Result",
+                          f"{_S.ESCALATION_MODEL} VERIFIED: PASS")
+            print(f"\nLog: {md_path}")
+            return True
 
-            # Observe hint
-            observe_hint = extract_observe_hint(response)
-            if observe_hint:
-                print(f"  [OBSERVE] LLM says observe output for {observe_hint}s")
+        # Handle installs
+        handle_installs(response, target)
 
-            # Extract code
-            print(f"\n[3] Extracting code from response...")
-            blocks = extract_blocks(response)
-            if not blocks:
-                print("  [WARN] No code blocks found.")
-                append_to_log(md_path, f"Escalation Attempt {attempt}",
-                              "No code blocks found.")
-                current_prompt = (
-                    "Your response contained no executable code. "
-                    "Please provide a complete script in a fenced code block."
-                )
-                continue
+        # Timeout hint
+        timeout_hint = extract_timeout_hint(response)
+        run_timeout = timeout_hint or timeout
+        if timeout_hint:
+            print(f"  [TIMEOUT] LLM says {timeout_hint}s needed")
 
-            scripts, commands = classify_blocks(blocks)
-            print(f"  Found: {len(scripts)} script(s), {len(commands)} command(s)")
+        # Observe hint
+        observe_hint = extract_observe_hint(response)
+        if observe_hint:
+            print(f"  [OBSERVE] LLM says observe output for {observe_hint}s")
 
-            # Deduplicate
-            if scripts:
-                unique_scripts = []
-                for block in scripts:
-                    code_hash = hash(block.code.strip())
-                    if code_hash in _saved_code_hashes:
-                        print(f"  [SKIP] Duplicate script detected, skipping.")
-                    else:
-                        unique_scripts.append(block)
-                        _saved_code_hashes.add(code_hash)
-                scripts = unique_scripts
+        # Extract code
+        print(f"\n[3] Extracting code from response...")
+        blocks = extract_blocks(response)
+        if not blocks:
+            print("  [WARN] No code blocks found.")
+            append_to_log(md_path, f"Escalation Attempt {attempt}",
+                          "No code blocks found.")
+            current_prompt = (
+                "Your response contained no executable code. "
+                "Please provide a complete script in a fenced code block."
+            )
+            continue
 
-            if not scripts and not commands:
-                print("  [WARN] No executable code after classification.")
-                current_prompt = (
-                    "Your response contained code but none were executable "
-                    "scripts or commands. Please provide a complete script."
-                )
-                continue
+        scripts, commands = classify_blocks(blocks)
+        print(f"  Found: {len(scripts)} script(s), {len(commands)} command(s)")
 
-            # Execute
-            print(f"\n[4] Executing on {target}...")
-            all_results = []
-            pre_snap = snapshot_dirs()
+        # Deduplicate
+        if scripts:
+            unique_scripts = []
+            for block in scripts:
+                code_hash = hash(block.code.strip())
+                if code_hash in _saved_code_hashes:
+                    print(f"  [SKIP] Duplicate script detected, skipping.")
+                else:
+                    unique_scripts.append(block)
+                    _saved_code_hashes.add(code_hash)
+            scripts = unique_scripts
 
-            if commands and target == "raspi":
-                cmd_results = run_commands_on_pi(commands, timeout=15)
-                all_results.extend(cmd_results)
+        if not scripts and not commands:
+            print("  [WARN] No executable code after classification.")
+            current_prompt = (
+                "Your response contained code but none were executable "
+                "scripts or commands. Please provide a complete script."
+            )
+            continue
 
-            if scripts:
-                saved_files = []
-                # Use attempt offset so filenames don't collide with Instant's
-                esc_attempt = attempt + 100  # e.g. _101, _102
-                for i, block in enumerate(scripts):
-                    fp = save_script(block, prompt, response, i, len(scripts), esc_attempt)
-                    saved_files.append((fp, block))
+        # Execute
+        print(f"\n[4] Executing on {target}...")
+        all_results = []
+        pre_snap = snapshot_dirs()
 
-                for fp, block in saved_files:
-                    append_to_log(md_path, f"Escalation Script: {fp.name}",
-                                  f"```{block.language}\n{block.code}\n```")
+        if commands and target == "raspi":
+            cmd_results = run_commands_on_pi(commands, timeout=15)
+            all_results.extend(cmd_results)
 
-                    effective_observe = observe_hint
-                    if not effective_observe and needs_observation(block.code):
-                        effective_observe = _AUTO_OBSERVE_SECONDS
-                        print(f"  [AUTO-OBSERVE] Script spawns child processes, "
-                              f"auto-enabling observation for {effective_observe}s")
+        if scripts:
+            saved_files = []
+            esc_attempt = attempt + 100
+            for i, block in enumerate(scripts):
+                fp = save_script(block, prompt, response, i, len(scripts), esc_attempt)
+                saved_files.append((fp, block))
 
-                    if target == "raspi":
-                        result = run_script_on_pi(fp, remote_dir or REMOTE_WORK_DIR,
-                                                  timeout=run_timeout, detach=detach)
-                    elif effective_observe:
-                        result = run_script_local_observed(
-                            fp, timeout=run_timeout, observe_seconds=effective_observe)
-                    else:
-                        result = run_script_local(fp, timeout=run_timeout)
-                    all_results.append(result)
+            for fp, block in saved_files:
+                append_to_log(md_path, f"Escalation Script: {fp.name}",
+                              f"```{block.language}\n{block.code}\n```")
 
-            executed = [r for r in all_results if not r.get("skipped")]
-            for r in executed:
-                out_path = save_output(r.get("name", "output"), r.get("stdout", ""),
-                                       r.get("stderr", ""), attempt + 100)
-                out_content = ""
-                if r.get("stdout"):
-                    out_content += f"STDOUT:\n```\n{r['stdout'][:3000]}\n```\n"
-                if r.get("stderr"):
-                    out_content += f"STDERR:\n```\n{r['stderr'][:2000]}\n```\n"
-                if not out_content:
-                    out_content = "(no output)\n"
-                append_to_log(md_path, f"Escalation Output: {out_path.name}", out_content)
+                effective_observe = observe_hint
+                if not effective_observe and needs_observation(block.code):
+                    effective_observe = _AUTO_OBSERVE_SECONDS
+                    print(f"  [AUTO-OBSERVE] Script spawns child processes, "
+                          f"auto-enabling observation for {effective_observe}s")
 
-            if not executed:
-                print("\n  [WARN] Nothing executed.")
-                current_prompt = "None of the code was executable. Please provide a runnable Python script."
-                continue
+                if target == "raspi":
+                    result = run_script_on_pi(fp, remote_dir or REMOTE_WORK_DIR,
+                                              timeout=run_timeout, detach=detach)
+                elif effective_observe:
+                    result = run_script_local_observed(
+                        fp, timeout=run_timeout, observe_seconds=effective_observe)
+                else:
+                    result = run_script_local(fp, timeout=run_timeout)
+                all_results.append(result)
 
-            if target == "local":
-                sweep_artifacts(pre_snap)
+        executed = [r for r in all_results if not r.get("skipped")]
+        for r in executed:
+            out_path = save_output(r.get("name", "output"), r.get("stdout", ""),
+                                   r.get("stderr", ""), attempt + 100)
+            out_content = ""
+            if r.get("stdout"):
+                out_content += f"STDOUT:\n```\n{r['stdout'][:3000]}\n```\n"
+            if r.get("stderr"):
+                out_content += f"STDERR:\n```\n{r['stderr'][:2000]}\n```\n"
+            if not out_content:
+                out_content = "(no output)\n"
+            append_to_log(md_path, f"Escalation Output: {out_path.name}", out_content)
 
-            # Log execution summary
-            exec_log = ""
-            for r in executed:
-                exec_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
-                if r.get("timed_out"):
-                    exec_log += f"(Timed out after {r.get('timeout', '?')}s)\n"
-            append_to_log(md_path, f"Escalation Attempt {attempt} Execution Summary", exec_log)
+        if not executed:
+            print("\n  [WARN] Nothing executed.")
+            current_prompt = "None of the code was executable. Please provide a runnable Python script."
+            continue
 
-            # Verify
-            if attempt > escalation_retries:
-                print(f"\n[FAIL] Escalation max retries ({escalation_retries}) reached.")
-                append_to_log(md_path, "Escalation Final Result",
-                              f"{_S.ESCALATION_MODEL} FAILED after {escalation_retries} retries.")
-                print(f"\nLog: {md_path}")
-                return False
+        if target == "local":
+            sweep_artifacts(pre_snap)
 
-            print(f"\n[5] Asking {_S.ESCALATION_MODEL} to verify output...")
-            current_prompt = build_verification_prompt(executed, prompt)
+        # Log execution summary
+        exec_log = ""
+        for r in executed:
+            exec_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
+            if r.get("timed_out"):
+                exec_log += f"(Timed out after {r.get('timeout', '?')}s)\n"
+        append_to_log(md_path, f"Escalation Attempt {attempt} Execution Summary", exec_log)
+
+        # Verify
+        if attempt > escalation_retries:
+            print(f"\n[FAIL] Escalation max retries ({escalation_retries}) reached.")
+            append_to_log(md_path, "Escalation Final Result",
+                          f"{_S.ESCALATION_MODEL} FAILED after {escalation_retries} retries.")
+            print(f"\nLog: {md_path}")
+            return False
+
+        print(f"\n[5] Asking {_S.ESCALATION_MODEL} to verify output...")
+        current_prompt = build_verification_prompt(executed, prompt)
 
     print(f"\nLog: {md_path}")
     return False

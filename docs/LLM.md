@@ -82,7 +82,10 @@ tests.py -> main (run_pipeline), core.session (for LLM assertion)
 - Follow-up prompts within each panel (multi-turn in same ChatGPT conversation)
 - File upload via drag-drop, paste, or attach button (uploaded to `uploads/`, text previews injected into prompt)
 - Toolbar dropdowns for History (raw_md), Programs, Outputs, Uploads -- each with Clear All button
+- One-click file buttons on each panel header (history, program, output) open file viewer modal with Copy All button
+- **Push to GitHub** button in toolbar: runs `git add -A && git commit && git push`. On failure, automatically spawns an agent that sends the git error through the LLM pipeline to diagnose and fix the issue (merge conflicts, upstream, auth, etc.)
 - Run Tests button spawns agent panels per test stream with live output and browser view
+- Model escalation visualization: when Instant fails and Thinking takes over, a new purple-tinted panel spawns with a curved glowing bezier line connecting them (shows context handoff)
 - Each agent gets its own cloned browser profile (avoids Playwright lock conflicts)
 - Profiles cleaned up on agent close; `.browser_profiles/` dir purged after tests
 
