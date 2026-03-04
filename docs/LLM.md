@@ -69,6 +69,7 @@ tests.py -> main (run_pipeline), core.session (for LLM assertion)
 - **Browser-based, not API**: Playwright automates ChatGPT's UI. No API keys, no per-token costs. Response detection uses stability checks (content stops growing for 5s).
 - **Prompt engineering**: LLM told to put ALL code in one fenced block, no text after closing fence. Also supports `TIMEOUT: N` hints for long-running scripts.
 - **Context injection**: Before first prompt, probes target (hostname, Python version, pip list, GPIO/I2C state for Pi) and injects as system context.
+- **Model escalation**: Defaults to Instant (fast). After 3 failures, auto-escalates to Thinking with the FULL raw_md transcript as context. Thinking sees every failed attempt and is told to try a different approach. Centralized model config in selectors.py so model URL params update in one place.
 - **Live streaming**: Pi execution streams stdout/stderr in real-time via `ssh_run_live()`. Local shows source + command + output + exit status.
 - **CRLF normalization**: Strips `\r` before saving to `programs/` to prevent bash errors on Pi.
 - **Artifact sweep**: After local execution, diffs filesystem for new non-code files, moves them to `outputs/`. Code files stay in place.
@@ -96,6 +97,39 @@ tests.py -> main (run_pipeline), core.session (for LLM assertion)
 | `--timeout N` | 30 | Execution timeout (LLM can override via TIMEOUT: hint) |
 | `--remote-dir` | ~/Documents | Pi working directory |
 | `--login` | -- | Manual ChatGPT login |
+| `--model` | instant | ChatGPT model: `instant`, `thinking`, or `auto` |
+| `--no-escalate` | OFF | Disable automatic escalation to Thinking on failure |
+
+## Model Escalation (Instant -> Thinking)
+
+Agent defaults to ChatGPT 5.3 Instant for speed. If Instant fails after max retries (default 3), Agent automatically escalates to GPT-5.2 Thinking:
+
+1. **Instant runs first** (fast, 3 retries). If it passes, done.
+2. **On failure**, Agent reads the ENTIRE raw_md transcript from the Instant run.
+3. **Opens a new ChatGPT session** using the Thinking model (via `?model=gpt-5.2-thinking` URL parameter).
+4. **Injects the full transcript** as context -- every prompt, response, code, output, and error. Thinking sees exactly what Instant tried and what went wrong.
+5. **Thinking gets 2 attempts** (configurable). The prompt explicitly tells it NOT to repeat the same mistakes and to try a different approach.
+6. **All attempts logged** to the same raw_md file under "Escalation" headers.
+
+Escalation scripts use offset filenames (e.g. `slug_101.py`) so they don't collide with Instant's versions in `programs/`.
+
+Model selection is centralized in `core/selectors.py` (the `MODELS` dict and `model_url()` function). When ChatGPT updates model names, change them there only.
+
+### Override Examples
+
+```bash
+# Default: Instant with auto-escalation
+python main.py "write fizzbuzz"
+
+# Skip Instant, go straight to Thinking
+python main.py "complex task" --model thinking
+
+# Instant only, no escalation
+python main.py "simple task" --no-escalate
+
+# Force Thinking, no escalation (Thinking only)
+python main.py "hard problem" --model thinking --no-escalate
+```
 
 ## Dependencies
 

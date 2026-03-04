@@ -860,7 +860,9 @@ def save_output(name: str, stdout: str, stderr: str, attempt: int) -> Path:
 def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                  timeout: int = 30, remote_dir: str = None,
                  headed: bool = True, profile_dir: Path = None,
-                 attachments: list = None, session: 'ChatGPTSession' = None) -> bool:
+                 attachments: list = None, session: 'ChatGPTSession' = None,
+                 model: str = None, escalate: bool = True,
+                 escalation_retries: int = 2) -> bool:
     """Main entry point. Prompt -> LLM -> execute -> verify -> retry.
 
     Args:
@@ -876,9 +878,20 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
         session: Optional pre-created ChatGPTSession. If provided, the
                  pipeline uses it directly and does NOT close it on exit.
                  The caller is responsible for the session lifecycle.
+        model: ChatGPT model to use ('instant', 'thinking', 'auto').
+               Defaults to 'instant' (from selectors.DEFAULT_MODEL).
+        escalate: If True (default), automatically escalate to the
+                  Thinking model after max_retries fail on Instant.
+                  The Thinking model gets the full raw_md transcript
+                  as context and runs escalation_retries more attempts.
+        escalation_retries: How many attempts the Thinking model gets
+                            (default: 2). Minimum 2 for a fair shot.
 
     Returns True if the LLM verified PASS, False otherwise.
     """
+
+    from core import chatgpt_selectors as _S
+    effective_model = model or _S.DEFAULT_MODEL
 
     # Resolve target
     resolved = target or classify_target(prompt)
@@ -887,8 +900,11 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
     print("=" * 60)
     print(f"Agent v2")
     print(f"  Target:  {resolved}")
+    print(f"  Model:   {effective_model}")
     print(f"  Prompt:  {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
     print(f"  Retries: {max_retries}")
+    if escalate and effective_model != _S.ESCALATION_MODEL:
+        print(f"  Escalation: ON (-> {_S.ESCALATION_MODEL} after {max_retries} failures)")
     if attachments:
         print(f"  Files:   {len(attachments)} attachment(s)")
     if detach:
@@ -912,14 +928,30 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
     # If an external session was provided, use it directly (no context manager).
     # Otherwise create one ourselves and close it when done.
     if session is not None:
-        return _run_pipeline_inner(session, initial_prompt, prompt, resolved,
-                                   max_retries, timeout, remote_dir, detach,
-                                   attachments, md_path)
+        result = _run_pipeline_inner(session, initial_prompt, prompt, resolved,
+                                     max_retries, timeout, remote_dir, detach,
+                                     attachments, md_path)
     else:
-        with ChatGPTSession(headed=headed, profile_dir=profile_dir) as sess:
-            return _run_pipeline_inner(sess, initial_prompt, prompt, resolved,
-                                       max_retries, timeout, remote_dir, detach,
-                                       attachments, md_path)
+        with ChatGPTSession(headed=headed, profile_dir=profile_dir,
+                            model=effective_model) as sess:
+            result = _run_pipeline_inner(sess, initial_prompt, prompt, resolved,
+                                         max_retries, timeout, remote_dir, detach,
+                                         attachments, md_path)
+
+    # --- ESCALATION: if Instant failed, try Thinking model ---
+    if not result and escalate and effective_model != _S.ESCALATION_MODEL:
+        result = _escalate_to_thinking(
+            prompt=prompt,
+            md_path=md_path,
+            target=resolved,
+            timeout=timeout,
+            remote_dir=remote_dir,
+            headed=headed,
+            profile_dir=profile_dir,
+            escalation_retries=max(escalation_retries, 2),
+        )
+
+    return result
 
 
 def _run_pipeline_inner(session, initial_prompt, prompt, resolved,
@@ -1116,6 +1148,308 @@ def _run_pipeline_inner(session, initial_prompt, prompt, resolved,
     # Should not reach here, but safety net
     print(f"\nLog: {md_path}")
     return False
+
+
+# ---------------------------------------------------------------------------
+# Model escalation -- Instant failed, try Thinking
+# ---------------------------------------------------------------------------
+
+def _escalate_to_thinking(prompt: str, md_path: Path, target: str,
+                          timeout: int, remote_dir: str,
+                          headed: bool, profile_dir: Path,
+                          escalation_retries: int = 2) -> bool:
+    """Escalate a failed Instant run to the Thinking model.
+
+    Opens a NEW ChatGPT session using the Thinking model. Sends it
+    the full raw_md transcript from the Instant run as context so it
+    can see every prompt, response, code, output, and error. Then
+    runs the pipeline loop for escalation_retries more attempts.
+
+    This gives the slower but smarter model a complete picture of
+    what went wrong, so it can take a different approach.
+
+    Returns True if Thinking model achieves PASS, False otherwise.
+    """
+    from core import chatgpt_selectors as _S
+
+    print()
+    print("=" * 60)
+    print("  MODEL ESCALATION")
+    print("=" * 60)
+    print(f"  Instant model failed after max retries.")
+    print(f"  Escalating to: {_S.ESCALATION_MODEL}")
+    print(f"  Retries: {escalation_retries}")
+    print(f"  Strategy: Full raw_md context injection")
+    print("=" * 60)
+    print()
+
+    # Read the full raw_md transcript from the Instant run
+    transcript = ""
+    if md_path and md_path.exists():
+        try:
+            transcript = md_path.read_text(encoding="utf-8")
+            print(f"  [CONTEXT] Loaded {len(transcript)} chars from {md_path.name}")
+        except Exception as e:
+            print(f"  [WARN] Could not read transcript: {e}")
+
+    # Log escalation to raw_md
+    append_to_log(md_path, "MODEL ESCALATION",
+                  f"Escalating from {_S.DEFAULT_MODEL} to {_S.ESCALATION_MODEL}.\n"
+                  f"Injecting full transcript ({len(transcript)} chars) as context.\n"
+                  f"Giving Thinking model {escalation_retries} attempts.")
+
+    # Build the escalation prompt: give Thinking the full context
+    # of what Instant tried and failed, plus the original task.
+    escalation_prompt = _build_escalation_prompt(prompt, transcript, target, remote_dir)
+
+    # Probe target again (state may have changed during Instant attempts)
+    print("\n[ESCALATION] Re-probing target...")
+    if target == "raspi":
+        context = probe_pi(remote_dir)
+    else:
+        context = probe_local()
+
+    detach = is_long_running(prompt)
+
+    # Open a new session with the Thinking model
+    with ChatGPTSession(headed=headed, profile_dir=profile_dir,
+                        model=_S.ESCALATION_MODEL) as sess:
+
+        print(f"\n[ESCALATION] Sending context + task to {_S.ESCALATION_MODEL}...")
+
+        # Track code hashes to avoid re-running Instant's exact same code
+        _saved_code_hashes = set()
+        current_prompt = escalation_prompt
+        is_followup = False
+
+        for attempt in range(1, escalation_retries + 2):
+            print(f"\n{'='*60}")
+            if attempt == 1:
+                print(f"[ESCALATION PROMPT 1] ({_S.ESCALATION_MODEL})")
+            elif attempt == 2:
+                print(f"[ESCALATION VERIFY 1] ({_S.ESCALATION_MODEL})")
+            else:
+                print(f"[ESCALATION RETRY {attempt - 2}] ({_S.ESCALATION_MODEL})")
+            print(f"{'='*60}")
+
+            append_to_log(md_path, f"Escalation Prompt {attempt} ({_S.ESCALATION_MODEL})",
+                          f"```\n{current_prompt[:2000]}{'...(truncated)' if len(current_prompt) > 2000 else ''}\n```")
+
+            # Send to ChatGPT
+            print(f"\n[2] Sending to ChatGPT ({len(current_prompt)} chars)...")
+            if is_followup:
+                response = sess.followup(current_prompt)
+            else:
+                response = sess.prompt(current_prompt)
+            is_followup = True
+
+            append_to_log(md_path, f"Escalation Response {attempt} ({_S.ESCALATION_MODEL})",
+                          response)
+
+            # Check for PASS
+            response_stripped = response.strip()
+            if response_stripped.upper().startswith("PASS"):
+                print(f"\n[DONE] {_S.ESCALATION_MODEL} verified: PASS")
+                append_to_log(md_path, f"Escalation Result",
+                              f"{_S.ESCALATION_MODEL} VERIFIED: PASS")
+                print(f"\nLog: {md_path}")
+                return True
+
+            # Handle installs
+            handle_installs(response, target)
+
+            # Timeout hint
+            timeout_hint = extract_timeout_hint(response)
+            run_timeout = timeout_hint or timeout
+            if timeout_hint:
+                print(f"  [TIMEOUT] LLM says {timeout_hint}s needed")
+
+            # Observe hint
+            observe_hint = extract_observe_hint(response)
+            if observe_hint:
+                print(f"  [OBSERVE] LLM says observe output for {observe_hint}s")
+
+            # Extract code
+            print(f"\n[3] Extracting code from response...")
+            blocks = extract_blocks(response)
+            if not blocks:
+                print("  [WARN] No code blocks found.")
+                append_to_log(md_path, f"Escalation Attempt {attempt}",
+                              "No code blocks found.")
+                current_prompt = (
+                    "Your response contained no executable code. "
+                    "Please provide a complete script in a fenced code block."
+                )
+                continue
+
+            scripts, commands = classify_blocks(blocks)
+            print(f"  Found: {len(scripts)} script(s), {len(commands)} command(s)")
+
+            # Deduplicate
+            if scripts:
+                unique_scripts = []
+                for block in scripts:
+                    code_hash = hash(block.code.strip())
+                    if code_hash in _saved_code_hashes:
+                        print(f"  [SKIP] Duplicate script detected, skipping.")
+                    else:
+                        unique_scripts.append(block)
+                        _saved_code_hashes.add(code_hash)
+                scripts = unique_scripts
+
+            if not scripts and not commands:
+                print("  [WARN] No executable code after classification.")
+                current_prompt = (
+                    "Your response contained code but none were executable "
+                    "scripts or commands. Please provide a complete script."
+                )
+                continue
+
+            # Execute
+            print(f"\n[4] Executing on {target}...")
+            all_results = []
+            pre_snap = snapshot_dirs()
+
+            if commands and target == "raspi":
+                cmd_results = run_commands_on_pi(commands, timeout=15)
+                all_results.extend(cmd_results)
+
+            if scripts:
+                saved_files = []
+                # Use attempt offset so filenames don't collide with Instant's
+                esc_attempt = attempt + 100  # e.g. _101, _102
+                for i, block in enumerate(scripts):
+                    fp = save_script(block, prompt, response, i, len(scripts), esc_attempt)
+                    saved_files.append((fp, block))
+
+                for fp, block in saved_files:
+                    append_to_log(md_path, f"Escalation Script: {fp.name}",
+                                  f"```{block.language}\n{block.code}\n```")
+
+                    effective_observe = observe_hint
+                    if not effective_observe and needs_observation(block.code):
+                        effective_observe = _AUTO_OBSERVE_SECONDS
+                        print(f"  [AUTO-OBSERVE] Script spawns child processes, "
+                              f"auto-enabling observation for {effective_observe}s")
+
+                    if target == "raspi":
+                        result = run_script_on_pi(fp, remote_dir or REMOTE_WORK_DIR,
+                                                  timeout=run_timeout, detach=detach)
+                    elif effective_observe:
+                        result = run_script_local_observed(
+                            fp, timeout=run_timeout, observe_seconds=effective_observe)
+                    else:
+                        result = run_script_local(fp, timeout=run_timeout)
+                    all_results.append(result)
+
+            executed = [r for r in all_results if not r.get("skipped")]
+            for r in executed:
+                out_path = save_output(r.get("name", "output"), r.get("stdout", ""),
+                                       r.get("stderr", ""), attempt + 100)
+                out_content = ""
+                if r.get("stdout"):
+                    out_content += f"STDOUT:\n```\n{r['stdout'][:3000]}\n```\n"
+                if r.get("stderr"):
+                    out_content += f"STDERR:\n```\n{r['stderr'][:2000]}\n```\n"
+                if not out_content:
+                    out_content = "(no output)\n"
+                append_to_log(md_path, f"Escalation Output: {out_path.name}", out_content)
+
+            if not executed:
+                print("\n  [WARN] Nothing executed.")
+                current_prompt = "None of the code was executable. Please provide a runnable Python script."
+                continue
+
+            if target == "local":
+                sweep_artifacts(pre_snap)
+
+            # Log execution summary
+            exec_log = ""
+            for r in executed:
+                exec_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
+                if r.get("timed_out"):
+                    exec_log += f"(Timed out after {r.get('timeout', '?')}s)\n"
+            append_to_log(md_path, f"Escalation Attempt {attempt} Execution Summary", exec_log)
+
+            # Verify
+            if attempt > escalation_retries:
+                print(f"\n[FAIL] Escalation max retries ({escalation_retries}) reached.")
+                append_to_log(md_path, "Escalation Final Result",
+                              f"{_S.ESCALATION_MODEL} FAILED after {escalation_retries} retries.")
+                print(f"\nLog: {md_path}")
+                return False
+
+            print(f"\n[5] Asking {_S.ESCALATION_MODEL} to verify output...")
+            current_prompt = build_verification_prompt(executed, prompt)
+
+    print(f"\nLog: {md_path}")
+    return False
+
+
+def _build_escalation_prompt(original_prompt: str, transcript: str,
+                             target: str, remote_dir: str = None) -> str:
+    """Build the context-rich prompt for the Thinking model.
+
+    Includes the full raw_md transcript from the Instant model's failed
+    attempts so Thinking can see exactly what was tried and what went wrong.
+    """
+    rdir = remote_dir or REMOTE_WORK_DIR
+    target_desc = "Raspberry Pi 5 via SSH" if target == "raspi" else "this local machine"
+
+    # Truncate transcript if extremely long (Thinking model has limits too)
+    max_transcript = 15000
+    if len(transcript) > max_transcript:
+        transcript_trimmed = transcript[:max_transcript] + "\n\n...(transcript truncated)..."
+    else:
+        transcript_trimmed = transcript
+
+    if target == "raspi":
+        exec_env = (
+            "- My runner uploads your code to the Pi and executes it via SSH.\n"
+            "- Supported languages: Python (.py), Bash (.sh), C/C++ (.c/.cpp, compiled on Pi)."
+        )
+    else:
+        exec_env = (
+            "- My runner saves your code to a .py file and executes it with Python.\n"
+            "- ALWAYS write Python, even for simple tasks (folders, file ops, git, shell commands).\n"
+            "- Use subprocess.run() for system/shell commands. Use os, shutil, pathlib for file ops.\n"
+            "- NEVER write bash/shell scripts -- only Python works here."
+        )
+
+    return (
+        f"=== ROLE ===\n"
+        f"You are helping me debug and write code for hardware.\n"
+        f"Code will be deployed and executed on: {target_desc}.\n"
+        f"\n"
+        f"=== IMPORTANT: PREVIOUS ATTEMPTS FAILED ===\n"
+        f"A faster model (Instant) already tried this task {3} times and FAILED.\n"
+        f"Below is the COMPLETE transcript of everything it tried -- every prompt,\n"
+        f"every response, every piece of code, and every execution output/error.\n"
+        f"Study this carefully. DO NOT repeat the same mistakes.\n"
+        f"Take a DIFFERENT approach if the previous one clearly wasn't working.\n"
+        f"\n"
+        f"=== FULL TRANSCRIPT FROM PREVIOUS ATTEMPTS ===\n"
+        f"{transcript_trimmed}\n"
+        f"\n"
+        f"=== EXECUTION ENVIRONMENT ===\n"
+        f"{exec_env}\n"
+        f"\n"
+        f"=== RESPONSE FORMAT ===\n"
+        f"- Put ALL code inside exactly ONE fenced code block (```language\\n...code...\\n```).\n"
+        f"- Do NOT put any text after the closing ```. No usage instructions, no \"how to run\".\n"
+        f"- If you need multiple files or steps, combine them into ONE script.\n"
+        f"- If you need a package installed, include INSTALL: package1, package2 BEFORE the code block.\n"
+        f"- If this will take longer than 30s to run, include TIMEOUT: <seconds> BEFORE the code block.\n"
+        f"\n"
+        f"=== RULES ===\n"
+        f"- SIMPLICITY FIRST: prefer the simplest, most direct solution.\n"
+        f"- Learn from the failed attempts above. Fix the root cause, don't just retry.\n"
+        f"- ASCII only in code output. No emojis.\n"
+        f"- Print clear status messages so I can see what happened.\n"
+        f"\n"
+        f"=== TASK (original request) ===\n"
+        f"{original_prompt}\n"
+    )
 
 
 def run_followup_pipeline(session, followup_prompt: str, md_path=None,
@@ -1376,6 +1710,12 @@ def main():
                         help="Attach file(s) to send to ChatGPT (images, CSVs, etc.)")
     parser.add_argument("--cli", action="store_true",
                         help="Force CLI mode (skip UI even with no prompt)")
+    parser.add_argument("--model", choices=["instant", "thinking", "auto"],
+                        default=None,
+                        help="ChatGPT model (default: instant). "
+                             "'thinking' uses GPT-5.2 Thinking.")
+    parser.add_argument("--no-escalate", action="store_true",
+                        help="Disable automatic escalation to Thinking model on failure")
 
     args = parser.parse_args()
 
@@ -1413,6 +1753,8 @@ def main():
         remote_dir=args.remote_dir,
         headed=not args.headless,
         attachments=file_paths,
+        model=args.model,
+        escalate=not args.no_escalate,
     )
 
 

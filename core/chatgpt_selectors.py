@@ -4,12 +4,57 @@ selectors.py -- ChatGPT DOM selectors (centralized for easy updates)
 ChatGPT frequently changes its frontend. When automation breaks,
 update selectors HERE only. Everything else stays the same.
 
-Last verified: Feb 2026
+Last verified: Mar 2026
 """
 
 # --- Navigation ---
 CHATGPT_URL = "https://chat.openai.com"
 NEW_CHAT_URL = "https://chat.openai.com/?model=auto"
+
+# --- Model Configuration ---
+# Maps logical model names to ChatGPT URL model parameters.
+# The URL parameter ?model=<value> selects the model for a new chat.
+# Update these when ChatGPT changes model names.
+MODELS = {
+    "instant":    "gpt-5.3-instant",    # Default: fast, cheap
+    "thinking":   "gpt-5.2-thinking",   # Escalation: slower, smarter
+    "auto":       "auto",               # Let ChatGPT decide
+}
+
+DEFAULT_MODEL = "instant"
+ESCALATION_MODEL = "thinking"
+
+# How to build a new-chat URL for a specific model
+def model_url(model_key: str) -> str:
+    """Return the new-chat URL for the given model key."""
+    param = MODELS.get(model_key, MODELS[DEFAULT_MODEL])
+    return f"{CHATGPT_URL}/?model={param}"
+
+# --- Model Picker DOM Selectors ---
+# Used as a fallback if URL-based model selection doesn't work.
+# ChatGPT's model picker is a dropdown button at the top of the page.
+MODEL_PICKER_BUTTON_SELECTORS = [
+    'button[data-testid="model-selector"]',
+    'button:has-text("Instant")',
+    'button:has-text("Thinking")',
+    'button:has-text("GPT")',
+]
+
+# After clicking the picker, menu items appear. These selectors find them.
+MODEL_MENU_ITEM_SELECTORS = {
+    "instant": [
+        'div[role="menuitem"]:has-text("Instant 5.3")',
+        'div[role="menuitem"]:has-text("Instant")',
+        'div[role="option"]:has-text("Instant 5.3")',
+        'div[role="option"]:has-text("Instant")',
+    ],
+    "thinking": [
+        'div[role="menuitem"]:has-text("Thinking 5.2")',
+        'div[role="menuitem"]:has-text("Thinking")',
+        'div[role="option"]:has-text("Thinking 5.2")',
+        'div[role="option"]:has-text("Thinking")',
+    ],
+}
 
 # --- Prompt Input ---
 PROMPT_TEXTAREA = "#prompt-textarea"

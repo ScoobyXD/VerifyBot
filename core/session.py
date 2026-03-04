@@ -32,11 +32,15 @@ class ChatGPTSession:
                      .browser_profile/ in the project root. For parallel
                      agents, pass a unique directory per agent -- each
                      Chromium instance needs its own user_data_dir.
+        model: Which ChatGPT model to use. Options: 'instant' (default),
+               'thinking', 'auto'. See selectors.py MODELS dict.
     """
 
-    def __init__(self, headed: bool = True, profile_dir: Path = None):
+    def __init__(self, headed: bool = True, profile_dir: Path = None,
+                 model: str = None):
         self._headed = headed
         self._profile_dir = profile_dir or PROFILE_DIR
+        self._model = model or S.DEFAULT_MODEL
         self._pw = None
         self._ctx = None
         self._page = None
@@ -200,11 +204,12 @@ class ChatGPTSession:
             time.sleep(2)
 
     def _navigate_to_new_chat(self):
-        self._page.goto(S.NEW_CHAT_URL, wait_until="domcontentloaded",
+        url = S.model_url(self._model)
+        self._page.goto(url, wait_until="domcontentloaded",
                         timeout=S.NAVIGATION_TIMEOUT * 1000)
         self._page.wait_for_selector(S.PROMPT_TEXTAREA,
                                      timeout=S.NAVIGATION_TIMEOUT * 1000)
-        print("[OK] ChatGPT loaded, ready for prompt.")
+        print(f"[OK] ChatGPT loaded (model={self._model}), ready for prompt.")
 
     def _send_and_wait(self, text: str) -> str:
         page = self._page

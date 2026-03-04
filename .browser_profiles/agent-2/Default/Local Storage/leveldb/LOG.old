@@ -1,0 +1,15 @@
+2026/03/03-17:27:09.930 9e60 Reusing MANIFEST C:\Users\Jonat\Agent\.browser_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/03/03-17:27:09.939 9e60 Recovering log #1025
+2026/03/03-17:27:09.950 9e60 Reusing old log C:\Users\Jonat\Agent\.browser_profile\Default\Local Storage\leveldb/001025.log 
+2026/03/03-17:27:27.390 5164 Level-0 table #1029: started
+2026/03/03-17:27:27.401 5164 Level-0 table #1029: 22912 bytes OK
+2026/03/03-17:27:27.405 5164 Delete type=0 #1025
+2026/03/03-17:27:27.406 5164 Compacting 4@0 + 1@1 files
+2026/03/03-17:27:27.422 5164 Generated table #1030@0: 22 keys, 90395 bytes
+2026/03/03-17:27:27.422 5164 Compacted 4@0 + 1@1 files => 90395 bytes
+2026/03/03-17:27:27.423 5164 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/03/03-17:27:27.424 5164 Delete type=2 #1018
+2026/03/03-17:27:27.425 5164 Delete type=2 #1020
+2026/03/03-17:27:27.425 5164 Delete type=2 #1023
+2026/03/03-17:27:27.425 5164 Delete type=2 #1026
+2026/03/03-17:27:27.425 5164 Delete type=2 #1029
