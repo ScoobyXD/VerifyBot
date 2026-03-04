@@ -542,10 +542,14 @@ def on_run_agent(data):
                 except Exception:
                     pass
 
-            # --- Monkey-patch _wait_for_response for live screenshots ---
-            _orig_wait = ChatGPTSession._wait_for_response
+            # --- Patch THIS session instance for live screenshots ---
+            # IMPORTANT: We bind to the instance, not the class, so parallel
+            # agents don't stomp on each other's methods.
+            import types as _types
 
-            def _patched_wait(self_sess, timeout_val=None):
+            _orig_wait = session._wait_for_response
+
+            def _patched_wait(timeout_val=None):
                 import time as _time
                 from core import chatgpt_selectors as _S
                 _timeout = timeout_val if timeout_val is not None else _S.RESPONSE_TIMEOUT
@@ -557,22 +561,22 @@ def on_run_agent(data):
                 while _time.time() < deadline:
                     still_streaming = False
                     for sel in _S.STOP_GENERATING_SELECTORS:
-                        stop_btn = self_sess._page.query_selector(sel)
+                        stop_btn = session._page.query_selector(sel)
                         if stop_btn and stop_btn.is_visible():
                             still_streaming = True
                             break
 
                     if not still_streaming:
                         for sel in _S.RESPONSE_COMPLETE_INDICATORS:
-                            indicator = self_sess._page.query_selector(sel)
+                            indicator = session._page.query_selector(sel)
                             if indicator and indicator.is_visible():
-                                _take_screenshot(self_sess)
+                                _take_screenshot(session)
                                 print("[OK] Response complete.")
                                 return True
 
                         current_len = 0
                         for sel in _S.ASSISTANT_MESSAGE_SELECTORS:
-                            msgs = self_sess._page.query_selector_all(sel)
+                            msgs = session._page.query_selector_all(sel)
                             if msgs:
                                 try:
                                     current_len = len(msgs[-1].inner_text())
@@ -587,24 +591,25 @@ def on_run_agent(data):
                         last_text_len = current_len
 
                         if stable_count >= 5 and current_len > 50:
-                            _take_screenshot(self_sess)
+                            _take_screenshot(session)
                             print("[OK] Response appears complete (content stable).")
                             return True
 
-                    _take_screenshot(self_sess)
+                    _take_screenshot(session)
                     _time.sleep(1)
 
-                _take_screenshot(self_sess)
+                _take_screenshot(session)
                 print("[WARN] Response timeout -- may be incomplete.")
                 return False
 
-            _orig_nav = ChatGPTSession._navigate_to_new_chat
-            def _patched_nav(self_sess):
-                _orig_nav(self_sess)
-                _take_screenshot(self_sess)
+            _orig_nav = session._navigate_to_new_chat
 
-            ChatGPTSession._wait_for_response = _patched_wait
-            ChatGPTSession._navigate_to_new_chat = _patched_nav
+            def _patched_nav():
+                _orig_nav()
+                _take_screenshot(session)
+
+            session._wait_for_response = _patched_wait
+            session._navigate_to_new_chat = _patched_nav
 
             # ---- Phase 1: Run the pipeline ----
             try:
@@ -718,8 +723,7 @@ def on_run_agent(data):
                         _err.agent_id = None
 
             # ---- Phase 3: Cleanup (thread exiting) ----
-            ChatGPTSession._wait_for_response = _orig_wait
-            ChatGPTSession._navigate_to_new_chat = _orig_nav
+            # Instance-level patches die with the session, no class restore needed.
 
         except Exception as e:
             socketio.emit("agent_error", {"agent_id": agent_id, "error": str(e)}, to=sid)
@@ -791,13 +795,75 @@ def on_followup_agent(data):
 
 @socketio.on("close_agent")
 def on_close_agent(data):
-    """Send poison pill to the agent thread so it closes the session cleanly."""
+    """Force-kill an agent: close browser pages, cancel the pipeline,
+    poison the queue, and clean up the browser profile immediately.
+    Works no matter what stage the agent is in.
+    """
     agent_id = data.get("agent_id", "")
+
     with _agent_sessions_lock:
         session_info = _agent_sessions.get(agent_id)
-    if session_info:
-        # Poison pill tells the thread to exit its wait loop
+
+    if not session_info:
+        return
+
+    # 1. Set cancelled flag so the thread can check and bail out
+    session_info["cancelled"] = True
+
+    # 2. Force-close all browser pages to abort any in-flight navigation,
+    #    wait_for_selector, prompt sending, etc. This causes Playwright
+    #    calls to throw, which the thread catches and exits.
+    session = session_info.get("session")
+    if session:
+        try:
+            if hasattr(session, '_ctx') and session._ctx:
+                for pg in session._ctx.pages:
+                    try:
+                        pg.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Also close the browser context itself
+        try:
+            if hasattr(session, '_ctx') and session._ctx:
+                session._ctx.close()
+        except Exception:
+            pass
+
+    # 3. Send poison pill to unblock the queue wait loop
+    try:
         session_info["queue"].put(None)
+    except Exception:
+        pass
+
+    # 4. Clean up the cloned browser profile directory
+    def _cleanup_profile():
+        import shutil as _shutil_close
+        time.sleep(1)  # Brief delay for file locks to release
+        agent_profile = ROOT / ".browser_profiles" / agent_id
+        if agent_profile.exists():
+            try:
+                _shutil_close.rmtree(str(agent_profile), ignore_errors=True)
+            except Exception:
+                pass
+        # Also check for test stream profiles
+        for p in ROOT.iterdir():
+            if p.is_dir() and p.name.startswith(f".browser_profile_{agent_id}"):
+                try:
+                    _shutil_close.rmtree(str(p), ignore_errors=True)
+                except Exception:
+                    pass
+
+    threading.Thread(target=_cleanup_profile, daemon=True).start()
+
+    # 5. Remove from session tracking
+    with _agent_sessions_lock:
+        _agent_sessions.pop(agent_id, None)
+
+    # 6. Remove from agents tracking
+    with _agents_lock:
+        _agents.pop(agent_id, None)
 
 @socketio.on("run_tests")
 def on_run_tests(data):
@@ -917,10 +983,10 @@ def on_run_tests(data):
                                 "start_time": agent_start_time,
                             }
 
-                        # Monkeypatch screenshots
-                        _orig_wait = ChatGPTSession._wait_for_response
-                        def _patched_wait(self, *args, **kwargs):
-                            resp = _orig_wait(self, *args, **kwargs)
+                        # Patch THIS session instance for screenshots (not the class)
+                        _orig_wait = session._wait_for_response
+                        def _patched_wait(*args, **kwargs):
+                            resp = _orig_wait(*args, **kwargs)
                             try:
                                 img = session.screenshot()
                                 if img:
@@ -932,7 +998,7 @@ def on_run_tests(data):
                             except Exception:
                                 pass
                             return resp
-                        ChatGPTSession._wait_for_response = _patched_wait
+                        session._wait_for_response = _patched_wait
 
                         # Run each test in this stream
                         all_passed = True
@@ -1010,7 +1076,7 @@ def on_run_tests(data):
                             "success": all_passed,
                         }, to=sid)
 
-                        ChatGPTSession._wait_for_response = _orig_wait
+                        # Instance patches die with session, no restore needed
 
                     except Exception as e:
                         socketio.emit("agent_error", {
@@ -2029,36 +2095,57 @@ function toggleMin(id) {
 
 function closePanel(id) {
   const a = agents[id];
-  if (a) {
-    a.el.remove();
-    socket.emit('close_agent', { agent_id: id });
-    // Clean up escalation links
-    if (escalationLinks[id]) {
-      const linkId = 'esc-line-' + id.replace(/[^a-z0-9]/gi, '_');
+  if (!a) { delete agents[id]; return; }
+
+  a.el.remove();
+
+  // Determine the real server-side agent_id (escalation children use parent's id)
+  let serverAgentId = id;
+  if (escalationLinks[id]) {
+    // This is an escalation child -- the real agent is the parent
+    serverAgentId = escalationLinks[id].parentId;
+  }
+  socket.emit('close_agent', { agent_id: serverAgentId });
+
+  // Clean up escalation SVG if this panel is an escalation child
+  if (escalationLinks[id]) {
+    const linkId = 'esc-line-' + id.replace(/[^a-z0-9]/gi, '_');
+    ['', '-dot1', '-dot2', '-label'].forEach(s => {
+      const el = document.getElementById(linkId + s);
+      if (el) el.remove();
+    });
+    const parent = agents[escalationLinks[id].parentId];
+    if (parent) delete parent._escalatingTo;
+    delete escalationLinks[id];
+  }
+
+  // If this is a parent with an escalation child, also close the child
+  for (const [childId, link] of Object.entries(escalationLinks)) {
+    if (link.parentId === id) {
+      // Remove the SVG line
+      const linkId = 'esc-line-' + childId.replace(/[^a-z0-9]/gi, '_');
       ['', '-dot1', '-dot2', '-label'].forEach(s => {
         const el = document.getElementById(linkId + s);
         if (el) el.remove();
       });
-      // Clear parent's redirect
-      const parent = agents[escalationLinks[id].parentId];
-      if (parent) delete parent._escalatingTo;
-      delete escalationLinks[id];
-    }
-    // Also check if this is a parent with an escalation child
-    for (const [childId, link] of Object.entries(escalationLinks)) {
-      if (link.parentId === id) {
-        const linkId = 'esc-line-' + childId.replace(/[^a-z0-9]/gi, '_');
-        ['', '-dot1', '-dot2', '-label'].forEach(s => {
-          const el = document.getElementById(linkId + s);
-          if (el) el.remove();
-        });
-        delete escalationLinks[childId];
-      }
+      // Remove the child panel from DOM
+      const child = agents[childId];
+      if (child && child.el) child.el.remove();
+      delete agents[childId];
+      delete escalationLinks[childId];
     }
   }
+
   delete agents[id];
   if (Object.keys(agents).length === 0) {
     document.getElementById('canvas').innerHTML =
+      '<svg class="escalation-svg" id="escalationSvg"><defs>' +
+        '<linearGradient id="escGrad" x1="0%" y1="0%" x2="100%" y2="0%">' +
+          '<stop offset="0%" stop-color="rgba(168,130,255,.15)"/>' +
+          '<stop offset="30%" stop-color="rgba(168,130,255,.55)"/>' +
+          '<stop offset="70%" stop-color="rgba(168,130,255,.55)"/>' +
+          '<stop offset="100%" stop-color="rgba(168,130,255,.15)"/>' +
+        '</linearGradient></defs></svg>' +
       '<div class="welcome" id="welcome">' +
         '<div class="icon">A</div><h2>Agent Workbench</h2>' +
         '<p>Type a prompt below to spawn an agent.</p>' +
@@ -2066,6 +2153,8 @@ function closePanel(id) {
           '<div class="example-chip" onclick="useExample(this)">write a fizzbuzz script</div>' +
           '<div class="example-chip" onclick="useExample(this)">make a random number generator</div>' +
         '</div></div>';
+    escalationLinks = {};
+    activeEscalation = null;
   }
 }
 
@@ -2722,8 +2811,15 @@ socket.on('agent_output', function handleEscalationDetect(d) {
   if (text.includes('MODEL ESCALATION')) {
     activeEscalation = d.agent_id;
   }
-  // When we see the Thinking model session load, spawn the child panel
-  if (activeEscalation === d.agent_id && text.includes('ChatGPT loaded (model=thinking)')) {
+  // When we see the model switch complete, spawn the child panel.
+  // Match any of the possible switch messages:
+  //   "[OK] Switched model: instant -> thinking (via picker)"
+  //   "[OK] Switched model: instant -> thinking (via navigation)"
+  //   "[OK] ChatGPT loaded (model=thinking), ready for prompt."
+  if (activeEscalation === d.agent_id && (
+      (text.includes('Switched model') && text.includes('thinking')) ||
+      text.includes('ChatGPT loaded (model=thinking)')
+  )) {
     spawnEscalationPanel(d.agent_id);
     activeEscalation = null;
   }

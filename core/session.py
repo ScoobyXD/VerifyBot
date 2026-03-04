@@ -127,64 +127,17 @@ class ChatGPTSession:
     def switch_model(self, model_key: str):
         """Switch to a different model and start a new conversation.
 
-        Prefers using the DOM model picker (no page navigation needed).
-        Falls back to navigating to a new URL if the picker isn't found.
+        Uses URL-based navigation which is faster and more reliable than
+        trying to use the DOM model picker.
 
         Args:
             model_key: Model name from selectors.MODELS ('instant', 'thinking', 'auto').
         """
         old_model = self._model
         self._model = model_key
-
-        # Try DOM picker first -- faster and more reliable since we're
-        # already on ChatGPT and don't need to navigate/reload.
-        if self._try_switch_via_picker(model_key):
-            print(f"[OK] Switched model: {old_model} -> {model_key} (via picker)")
-            return
-
-        # Fallback: navigate to new chat URL with model param
-        print(f"  [MODEL] Picker method failed, navigating to new chat URL...")
         self._navigate_to_new_chat()
         self._in_conversation = False
-        print(f"[OK] Switched model: {old_model} -> {model_key} (via navigation)")
-
-    def _try_switch_via_picker(self, model_key: str) -> bool:
-        """Try to switch model using the DOM model picker dropdown.
-
-        Returns True if successful, False if picker couldn't be found/used.
-        """
-        page = self._page
-
-        # First, start a new conversation (clears current chat)
-        try:
-            # Look for "New chat" button or similar
-            new_chat_selectors = [
-                'a[href="/"]',
-                'nav a:first-child',
-                'button:has-text("New chat")',
-            ]
-            for sel in new_chat_selectors:
-                try:
-                    btn = page.query_selector(sel)
-                    if btn and btn.is_visible():
-                        btn.click()
-                        time.sleep(1.5)
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        # Wait for the page to settle
-        self._wait_for_chat_ready(timeout=10)
-
-        # Now use _ensure_model_selected to pick the right model
-        try:
-            self._ensure_model_selected()
-            self._in_conversation = False
-            return True
-        except Exception:
-            return False
+        print(f"[OK] Switched model: {old_model} -> {model_key}")
 
     # --- Internals ---
 
@@ -332,7 +285,7 @@ class ChatGPTSession:
             except Exception:
                 pass
 
-            time.sleep(1)
+            time.sleep(0.3)
 
         # Last resort: try clicking the center of the page where the
         # input usually is, then check one more time
@@ -373,7 +326,7 @@ class ChatGPTSession:
             return
 
         # Step 1: Check if the picker button already shows the right model
-        time.sleep(1)  # Let UI settle after navigation
+        time.sleep(0.3)  # Brief settle after navigation
         try:
             for sel in S.MODEL_PICKER_BUTTON_SELECTORS:
                 btn = page.query_selector(sel)
@@ -403,7 +356,7 @@ class ChatGPTSession:
 
         try:
             picker_btn.click()
-            time.sleep(0.8)  # Wait for dropdown animation
+            time.sleep(0.3)  # Wait for dropdown
         except Exception as e:
             print(f"  [WARN] Could not click model picker: {e}")
             return
@@ -418,7 +371,7 @@ class ChatGPTSession:
                     item.click()
                     clicked = True
                     print(f"  [MODEL] Selected {target} from picker")
-                    time.sleep(1)  # Let UI update
+                    time.sleep(0.3)  # Let UI update
                     break
             except Exception:
                 continue
@@ -434,7 +387,7 @@ class ChatGPTSession:
                                 item.click()
                                 clicked = True
                                 print(f"  [MODEL] Selected '{lbl}' from picker (fallback)")
-                                time.sleep(1)
+                                time.sleep(0.3)
                                 break
                         except Exception:
                             continue

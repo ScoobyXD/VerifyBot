@@ -1206,15 +1206,8 @@ def _escalate_to_thinking(prompt: str, md_path: Path, target: str,
                   f"Injecting full transcript ({len(transcript)} chars) as context.\n"
                   f"Giving Thinking model {escalation_retries} attempts.")
 
-    # Build the escalation prompt
+    # Build the escalation prompt (full transcript, no truncation)
     escalation_prompt = _build_escalation_prompt(prompt, transcript, target, remote_dir)
-
-    # Probe target again (state may have changed during Instant attempts)
-    print("\n[ESCALATION] Re-probing target...")
-    if target == "raspi":
-        context = probe_pi(remote_dir)
-    else:
-        context = probe_local()
 
     detach = is_long_running(prompt)
 
@@ -1422,12 +1415,8 @@ def _build_escalation_prompt(original_prompt: str, transcript: str,
     rdir = remote_dir or REMOTE_WORK_DIR
     target_desc = "Raspberry Pi 5 via SSH" if target == "raspi" else "this local machine"
 
-    # Truncate transcript if extremely long (Thinking model has limits too)
-    max_transcript = 15000
-    if len(transcript) > max_transcript:
-        transcript_trimmed = transcript[:max_transcript] + "\n\n...(transcript truncated)..."
-    else:
-        transcript_trimmed = transcript
+    # Send the full transcript -- Thinking model needs all context
+    transcript_trimmed = transcript
 
     if target == "raspi":
         exec_env = (
