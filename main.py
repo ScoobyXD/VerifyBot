@@ -692,26 +692,6 @@ def run_script_local_observed(filepath: Path, timeout: int = 30,
         "pid": proc.pid,
     }
 
-def _print_output(r: dict):
-    """Print SSH result output."""
-    if r.get("stdout"):
-        for line in r["stdout"].strip().split("\n")[:15]:
-            print(f"    {line}")
-    if r.get("stderr"):
-        for line in r["stderr"].strip().split("\n")[:8]:
-            print(f"    [err] {line}")
-
-
-def _print_output_local(r: dict):
-    """Print local execution output."""
-    if r.get("stdout"):
-        for line in r["stdout"].strip().split("\n")[:15]:
-            print(f"    {line}")
-    if r.get("stderr"):
-        for line in r["stderr"].strip().split("\n")[:8]:
-            print(f"    [err] {line}")
-
-
 # ---------------------------------------------------------------------------
 # Long-running detection
 # ---------------------------------------------------------------------------
@@ -854,6 +834,150 @@ def save_output(name: str, stdout: str, stderr: str, attempt: int) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Shared extract → execute → verify loop
+# ---------------------------------------------------------------------------
+
+def _extract_execute_verify(response: str, session, prompt_label: str,
+                            task_prompt: str, target: str, timeout: int,
+                            remote_dir: str, detach: bool, attempt: int,
+                            md_path: Path, saved_code_hashes: set,
+                            attempt_offset: int = 0,
+                            no_code_ok: bool = False) -> dict:
+    """Shared logic: extract code from LLM response, execute, log results.
+
+    Returns a dict:
+        {"status": "pass"|"fail"|"no_code"|"no_exec"|"continue",
+         "executed": list, "next_prompt": str}
+
+    This is the core loop body used by _run_pipeline_inner,
+    _run_escalation_loop, and run_followup_pipeline.
+    """
+    response_stripped = response.strip()
+
+    # Check if LLM said PASS (from a verification followup)
+    if response_stripped.upper().startswith("PASS"):
+        print(f"\n[DONE] LLM verified: PASS")
+        append_to_log(md_path, f"{prompt_label} {attempt} Result", "LLM VERIFIED: PASS")
+        return {"status": "pass"}
+
+    # Handle install requests
+    handle_installs(response, target)
+
+    # Check for timeout/observe hints
+    timeout_hint = extract_timeout_hint(response)
+    run_timeout = timeout_hint or timeout
+    if timeout_hint:
+        print(f"  [TIMEOUT] LLM says {timeout_hint}s needed")
+
+    observe_hint = extract_observe_hint(response)
+    if observe_hint:
+        print(f"  [OBSERVE] LLM says observe output for {observe_hint}s")
+
+    # Extract code
+    print(f"\n[3] Extracting code from response...")
+    blocks = extract_blocks(response)
+    if not blocks:
+        print("  [WARN] No code blocks found.")
+        append_to_log(md_path, f"{prompt_label} {attempt}", "No code blocks found.")
+        if no_code_ok:
+            print("  [INFO] LLM responded without code (may be a text answer).")
+            return {"status": "pass"}
+        return {"status": "no_code",
+                "next_prompt": "Your response contained no executable code. "
+                               "Please provide a complete script in a fenced code block."}
+
+    scripts, commands = classify_blocks(blocks)
+    print(f"  Found: {len(scripts)} script(s), {len(commands)} command(s)")
+
+    # Deduplicate
+    if scripts:
+        unique = []
+        for block in scripts:
+            h = hash(block.code.strip())
+            if h not in saved_code_hashes:
+                unique.append(block)
+                saved_code_hashes.add(h)
+            else:
+                print(f"  [SKIP] Duplicate script detected, skipping.")
+        scripts = unique
+
+    if not scripts and not commands:
+        print("  [WARN] No executable code after classification.")
+        return {"status": "no_code",
+                "next_prompt": "Your response contained code but none were executable "
+                               "scripts or commands. Please provide a complete script."}
+
+    # Execute
+    print(f"\n[4] Executing on {target}...")
+    all_results = []
+    pre_snap = snapshot_dirs()
+
+    if commands:
+        if target == "raspi":
+            all_results.extend(run_commands_on_pi(commands, timeout=15))
+        else:
+            print(f"  [SKIP] {len(commands)} shell command(s) -- local runs Python only")
+
+    if scripts:
+        file_attempt = attempt + attempt_offset
+        saved_files = []
+        for i, block in enumerate(scripts):
+            fp = save_script(block, task_prompt, response, i, len(scripts), file_attempt)
+            saved_files.append((fp, block))
+
+        for fp, block in saved_files:
+            append_to_log(md_path, f"Saved Script: {fp.name} ({prompt_label} {attempt})",
+                          f"```{block.language}\n{block.code}\n```")
+
+            effective_observe = observe_hint
+            if not effective_observe and needs_observation(block.code):
+                effective_observe = _AUTO_OBSERVE_SECONDS
+                print(f"  [AUTO-OBSERVE] Script spawns child processes, "
+                      f"auto-enabling observation for {effective_observe}s")
+
+            if target == "raspi":
+                result = run_script_on_pi(fp, remote_dir or REMOTE_WORK_DIR,
+                                          timeout=run_timeout, detach=detach)
+            elif effective_observe:
+                result = run_script_local_observed(
+                    fp, timeout=run_timeout, observe_seconds=effective_observe)
+            else:
+                result = run_script_local(fp, timeout=run_timeout)
+            all_results.append(result)
+
+    # Save outputs
+    executed = [r for r in all_results if not r.get("skipped")]
+    for r in executed:
+        out_path = save_output(r.get("name", "output"), r.get("stdout", ""),
+                               r.get("stderr", ""), attempt + attempt_offset)
+        out_content = ""
+        if r.get("stdout"):
+            out_content += f"STDOUT:\n```\n{r['stdout'][:3000]}\n```\n"
+        if r.get("stderr"):
+            out_content += f"STDERR:\n```\n{r['stderr'][:2000]}\n```\n"
+        append_to_log(md_path, f"Output: {out_path.name} ({prompt_label} {attempt})",
+                      out_content or "(no output)\n")
+
+    if not executed:
+        print("\n  [WARN] Nothing executed.")
+        return {"status": "no_exec",
+                "next_prompt": "None of the code was executable. Please provide a runnable Python script."}
+
+    if target == "local":
+        sweep_artifacts(pre_snap)
+
+    # Log execution summary
+    exec_log = ""
+    for r in executed:
+        exec_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
+        if r.get("timed_out"):
+            exec_log += f"(Timed out after {r.get('timeout', '?')}s)\n"
+    append_to_log(md_path, f"{prompt_label} {attempt} Execution Summary", exec_log)
+
+    return {"status": "continue", "executed": executed}
+
+
+# ---------------------------------------------------------------------------
 # The pipeline
 # ---------------------------------------------------------------------------
 
@@ -882,8 +1006,6 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                Defaults to 'instant' (from selectors.DEFAULT_MODEL).
         escalate: If True (default), automatically escalate to the
                   Thinking model after max_retries fail on Instant.
-                  The Thinking model gets the full raw_md transcript
-                  as context and runs escalation_retries more attempts.
         escalation_retries: How many attempts the Thinking model gets
                             (default: 2). Minimum 2 for a fair shot.
 
@@ -964,195 +1086,55 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
 def _run_pipeline_inner(session, initial_prompt, prompt, resolved,
                         max_retries, timeout, remote_dir, detach,
                         attachments, md_path) -> bool:
-    """Inner pipeline logic, factored out so it can work with either
-    an externally-owned session or a self-managed context-manager session."""
+    """Inner pipeline logic using the shared extract-execute-verify loop."""
     current_prompt = initial_prompt
     is_followup = False
+    saved_code_hashes = set()
 
-    # Track previously saved code to detect duplicates
-    _saved_code_hashes = set()
-
-    for attempt in range(1, max_retries + 2):  # attempt 1 = first try
+    for attempt in range(1, max_retries + 2):
         print(f"\n{'='*60}")
-        if attempt == 1:
-            print(f"[PROMPT 1]")
-        elif attempt == 2:
-            print(f"[VERIFY 1]")
-        else:
-            print(f"[RETRY {attempt - 2}]")
+        if attempt == 1: print("[PROMPT 1]")
+        elif attempt == 2: print("[VERIFY 1]")
+        else: print(f"[RETRY {attempt - 2}]")
         print(f"{'='*60}")
 
-        # Log what we're sending to the LLM
         append_to_log(md_path, f"Prompt Sent (Prompt {attempt})",
                       f"```\n{current_prompt}\n```")
 
-        # Step 3: Send to LLM
         print(f"\n[2] Sending to ChatGPT ({len(current_prompt)} chars)...")
         if is_followup:
             response = session.followup(current_prompt)
         else:
-            # First prompt: attach files if any
             response = session.prompt(current_prompt, files=attachments)
         is_followup = True
 
-        # Log response
         append_to_log(md_path, f"LLM Response (Prompt {attempt})", response)
 
-        # If response was incomplete (timed out), warn and still try to use it
         if hasattr(session, '_last_response_complete') and not session._last_response_complete:
             print("  [WARN] Response may be incomplete (timed out while streaming).")
-            append_to_log(md_path, f"Prompt {attempt} Warning",
-                          "Response may be incomplete -- ChatGPT was still streaming when timeout hit.")
 
-        # Check if the LLM just said PASS (from a verification followup)
-        response_stripped = response.strip()
-        if response_stripped.upper().startswith("PASS"):
-            print(f"\n[DONE] LLM verified: PASS")
-            append_to_log(md_path, f"Prompt {attempt} Result",
-                          "LLM VERIFIED: PASS")
+        result = _extract_execute_verify(
+            response=response, session=session, prompt_label="Prompt",
+            task_prompt=prompt, target=resolved, timeout=timeout,
+            remote_dir=remote_dir, detach=detach, attempt=attempt,
+            md_path=md_path, saved_code_hashes=saved_code_hashes,
+        )
+
+        if result["status"] == "pass":
             print(f"\nLog: {md_path}")
             return True
-
-        # Handle install requests
-        handle_installs(response, resolved)
-
-        # Check for timeout hint from LLM
-        timeout_hint = extract_timeout_hint(response)
-        run_timeout = timeout_hint or timeout
-        if timeout_hint:
-            print(f"  [TIMEOUT] LLM says {timeout_hint}s needed")
-
-        # Check for observe hint from LLM (for long-running processes)
-        observe_hint = extract_observe_hint(response)
-        if observe_hint:
-            print(f"  [OBSERVE] LLM says observe output for {observe_hint}s")
-
-        # Step 4: Extract code
-        print(f"\n[3] Extracting code from response...")
-        blocks = extract_blocks(response)
-        if not blocks:
-            print("  [WARN] No code blocks found.")
-            append_to_log(md_path, f"Prompt {attempt}", "No code blocks found.")
-            current_prompt = (
-                "Your response contained no executable code. "
-                "Please provide a complete script in a fenced code block."
-            )
+        elif result["status"] in ("no_code", "no_exec"):
+            current_prompt = result["next_prompt"]
             continue
+        elif result["status"] == "continue":
+            if attempt > max_retries:
+                print(f"\n[FAIL] Max retries ({max_retries}) reached.")
+                append_to_log(md_path, "Final Result", f"FAILED after {max_retries} retries.")
+                print(f"\nLog: {md_path}")
+                return False
+            print(f"\n[5] Asking ChatGPT to verify output...")
+            current_prompt = build_verification_prompt(result["executed"], prompt)
 
-        scripts, commands = classify_blocks(blocks)
-        print(f"  Found: {len(scripts)} script(s), {len(commands)} command(s)")
-
-        # Deduplicate scripts: skip if code identical to a previous prompt
-        if scripts:
-            unique_scripts = []
-            for block in scripts:
-                code_hash = hash(block.code.strip())
-                if code_hash in _saved_code_hashes:
-                    print(f"  [SKIP] Duplicate script detected (same code as previous prompt), skipping.")
-                else:
-                    unique_scripts.append(block)
-                    _saved_code_hashes.add(code_hash)
-            scripts = unique_scripts
-
-        if not scripts and not commands:
-            print("  [WARN] No executable code after classification.")
-            append_to_log(md_path, f"Prompt {attempt}",
-                          "Extracted blocks but none executable.")
-            current_prompt = (
-                "Your response contained code but none were executable "
-                "scripts or commands. Please provide a complete script."
-            )
-            continue
-
-        # Step 5: Execute
-        print(f"\n[4] Executing on {resolved}...")
-        all_results = []
-
-        # Snapshot filesystem before execution so we can find new artifacts after
-        pre_snap = snapshot_dirs()
-
-        # Commands (raspi only -- local uses Python for everything)
-        if commands:
-            if resolved == "raspi":
-                cmd_results = run_commands_on_pi(commands, timeout=15)
-                all_results.extend(cmd_results)
-            else:
-                print(f"  [SKIP] {len(commands)} shell command(s) -- local runs Python only")
-
-        # Scripts — versioned, never overwrite
-        if scripts:
-            saved_files = []
-            for i, block in enumerate(scripts):
-                fp = save_script(block, prompt, response, i, len(scripts), attempt)
-                saved_files.append((fp, block))
-
-            for fp, block in saved_files:
-                # Log the saved script into raw_md
-                append_to_log(md_path, f"Saved Script: {fp.name} (Prompt {attempt})",
-                              f"```{block.language}\n{block.code}\n```")
-
-                # Determine execution mode
-                effective_observe = observe_hint
-                if not effective_observe and needs_observation(block.code):
-                    effective_observe = _AUTO_OBSERVE_SECONDS
-                    print(f"  [AUTO-OBSERVE] Script spawns child processes, "
-                          f"auto-enabling observation for {effective_observe}s")
-
-                if resolved == "raspi":
-                    result = run_script_on_pi(fp, remote_dir or REMOTE_WORK_DIR,
-                                              timeout=run_timeout, detach=detach)
-                elif effective_observe:
-                    result = run_script_local_observed(
-                        fp, timeout=run_timeout, observe_seconds=effective_observe)
-                else:
-                    result = run_script_local(fp, timeout=run_timeout)
-                all_results.append(result)
-
-        # Save outputs — versioned, never overwrite
-        executed = [r for r in all_results if not r.get("skipped")]
-        for r in executed:
-            out_path = save_output(r.get("name", "output"), r.get("stdout", ""),
-                                   r.get("stderr", ""), attempt)
-            # Log the output file into raw_md
-            out_content = ""
-            if r.get("stdout"):
-                out_content += f"STDOUT:\n```\n{r['stdout'][:3000]}\n```\n"
-            if r.get("stderr"):
-                out_content += f"STDERR:\n```\n{r['stderr'][:2000]}\n```\n"
-            if not out_content:
-                out_content = "(no output)\n"
-            append_to_log(md_path, f"Output: {out_path.name} (Prompt {attempt})",
-                          out_content)
-
-        if not executed:
-            print("\n  [WARN] Nothing executed.")
-            current_prompt = "None of the code was executable. Please provide a runnable Python script."
-            continue
-
-        # Sweep file artifacts created by the script into outputs/
-        if resolved == "local":
-            sweep_artifacts(pre_snap)
-
-        # Log execution summary
-        exec_log = ""
-        for r in executed:
-            exec_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
-            if r.get("timed_out"):
-                exec_log += f"(Timed out after {r.get('timeout', '?')}s)\n"
-        append_to_log(md_path, f"Prompt {attempt} Execution Summary", exec_log)
-
-        # Step 6: Ask the LLM to verify — IT decides pass/fail
-        if attempt > max_retries:
-            print(f"\n[FAIL] Max retries ({max_retries}) reached.")
-            append_to_log(md_path, "Final Result",
-                          f"FAILED after {max_retries} retries.")
-            print(f"\nLog: {md_path}")
-            return False
-
-        print(f"\n[5] Asking ChatGPT to verify output...")
-        current_prompt = build_verification_prompt(executed, prompt)
-
-    # Should not reach here, but safety net
     print(f"\nLog: {md_path}")
     return False
 
@@ -1232,172 +1214,54 @@ def _escalate_to_thinking(prompt: str, md_path: Path, target: str,
 def _run_escalation_loop(sess, escalation_prompt, prompt, md_path, target,
                          timeout, remote_dir, detach, escalation_retries, _S,
                          escalation_files=None) -> bool:
-    """Inner loop for escalation attempts. Extracted so it works with
-    both reused sessions (UI) and fresh sessions (CLI)."""
-
-    _saved_code_hashes = set()
+    """Escalation loop using the shared extract-execute-verify logic."""
+    saved_code_hashes = set()
     current_prompt = escalation_prompt
     is_followup = False
+    model_label = _S.ESCALATION_MODEL
 
     for attempt in range(1, escalation_retries + 2):
         print(f"\n{'='*60}")
-        if attempt == 1:
-            print(f"[ESCALATION PROMPT 1] ({_S.ESCALATION_MODEL})")
-        elif attempt == 2:
-            print(f"[ESCALATION VERIFY 1] ({_S.ESCALATION_MODEL})")
-        else:
-            print(f"[ESCALATION RETRY {attempt - 2}] ({_S.ESCALATION_MODEL})")
+        if attempt == 1: print(f"[ESCALATION PROMPT 1] ({model_label})")
+        elif attempt == 2: print(f"[ESCALATION VERIFY 1] ({model_label})")
+        else: print(f"[ESCALATION RETRY {attempt - 2}] ({model_label})")
         print(f"{'='*60}")
 
-        append_to_log(md_path, f"Escalation Prompt {attempt} ({_S.ESCALATION_MODEL})",
+        append_to_log(md_path, f"Escalation Prompt {attempt} ({model_label})",
                       f"```\n{current_prompt[:2000]}{'...(truncated)' if len(current_prompt) > 2000 else ''}\n```")
 
-        # Send to ChatGPT
         print(f"\n[2] Sending to ChatGPT ({len(current_prompt)} chars)...")
         if is_followup:
             response = sess.followup(current_prompt)
         else:
-            # First prompt: attach the raw_md file so ChatGPT reads the transcript
             response = sess.prompt(current_prompt, files=escalation_files)
         is_followup = True
 
-        append_to_log(md_path, f"Escalation Response {attempt} ({_S.ESCALATION_MODEL})",
-                      response)
+        append_to_log(md_path, f"Escalation Response {attempt} ({model_label})", response)
 
-        # Check for PASS
-        response_stripped = response.strip()
-        if response_stripped.upper().startswith("PASS"):
-            print(f"\n[DONE] {_S.ESCALATION_MODEL} verified: PASS")
-            append_to_log(md_path, f"Escalation Result",
-                          f"{_S.ESCALATION_MODEL} VERIFIED: PASS")
+        result = _extract_execute_verify(
+            response=response, session=sess, prompt_label="Escalation",
+            task_prompt=prompt, target=target, timeout=timeout,
+            remote_dir=remote_dir, detach=detach, attempt=attempt,
+            md_path=md_path, saved_code_hashes=saved_code_hashes,
+            attempt_offset=100,
+        )
+
+        if result["status"] == "pass":
             print(f"\nLog: {md_path}")
             return True
-
-        # Handle installs
-        handle_installs(response, target)
-
-        # Timeout hint
-        timeout_hint = extract_timeout_hint(response)
-        run_timeout = timeout_hint or timeout
-        if timeout_hint:
-            print(f"  [TIMEOUT] LLM says {timeout_hint}s needed")
-
-        # Observe hint
-        observe_hint = extract_observe_hint(response)
-        if observe_hint:
-            print(f"  [OBSERVE] LLM says observe output for {observe_hint}s")
-
-        # Extract code
-        print(f"\n[3] Extracting code from response...")
-        blocks = extract_blocks(response)
-        if not blocks:
-            print("  [WARN] No code blocks found.")
-            append_to_log(md_path, f"Escalation Attempt {attempt}",
-                          "No code blocks found.")
-            current_prompt = (
-                "Your response contained no executable code. "
-                "Please provide a complete script in a fenced code block."
-            )
+        elif result["status"] in ("no_code", "no_exec"):
+            current_prompt = result["next_prompt"]
             continue
-
-        scripts, commands = classify_blocks(blocks)
-        print(f"  Found: {len(scripts)} script(s), {len(commands)} command(s)")
-
-        # Deduplicate
-        if scripts:
-            unique_scripts = []
-            for block in scripts:
-                code_hash = hash(block.code.strip())
-                if code_hash in _saved_code_hashes:
-                    print(f"  [SKIP] Duplicate script detected, skipping.")
-                else:
-                    unique_scripts.append(block)
-                    _saved_code_hashes.add(code_hash)
-            scripts = unique_scripts
-
-        if not scripts and not commands:
-            print("  [WARN] No executable code after classification.")
-            current_prompt = (
-                "Your response contained code but none were executable "
-                "scripts or commands. Please provide a complete script."
-            )
-            continue
-
-        # Execute
-        print(f"\n[4] Executing on {target}...")
-        all_results = []
-        pre_snap = snapshot_dirs()
-
-        if commands and target == "raspi":
-            cmd_results = run_commands_on_pi(commands, timeout=15)
-            all_results.extend(cmd_results)
-
-        if scripts:
-            saved_files = []
-            esc_attempt = attempt + 100
-            for i, block in enumerate(scripts):
-                fp = save_script(block, prompt, response, i, len(scripts), esc_attempt)
-                saved_files.append((fp, block))
-
-            for fp, block in saved_files:
-                append_to_log(md_path, f"Escalation Script: {fp.name}",
-                              f"```{block.language}\n{block.code}\n```")
-
-                effective_observe = observe_hint
-                if not effective_observe and needs_observation(block.code):
-                    effective_observe = _AUTO_OBSERVE_SECONDS
-                    print(f"  [AUTO-OBSERVE] Script spawns child processes, "
-                          f"auto-enabling observation for {effective_observe}s")
-
-                if target == "raspi":
-                    result = run_script_on_pi(fp, remote_dir or REMOTE_WORK_DIR,
-                                              timeout=run_timeout, detach=detach)
-                elif effective_observe:
-                    result = run_script_local_observed(
-                        fp, timeout=run_timeout, observe_seconds=effective_observe)
-                else:
-                    result = run_script_local(fp, timeout=run_timeout)
-                all_results.append(result)
-
-        executed = [r for r in all_results if not r.get("skipped")]
-        for r in executed:
-            out_path = save_output(r.get("name", "output"), r.get("stdout", ""),
-                                   r.get("stderr", ""), attempt + 100)
-            out_content = ""
-            if r.get("stdout"):
-                out_content += f"STDOUT:\n```\n{r['stdout'][:3000]}\n```\n"
-            if r.get("stderr"):
-                out_content += f"STDERR:\n```\n{r['stderr'][:2000]}\n```\n"
-            if not out_content:
-                out_content = "(no output)\n"
-            append_to_log(md_path, f"Escalation Output: {out_path.name}", out_content)
-
-        if not executed:
-            print("\n  [WARN] Nothing executed.")
-            current_prompt = "None of the code was executable. Please provide a runnable Python script."
-            continue
-
-        if target == "local":
-            sweep_artifacts(pre_snap)
-
-        # Log execution summary
-        exec_log = ""
-        for r in executed:
-            exec_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
-            if r.get("timed_out"):
-                exec_log += f"(Timed out after {r.get('timeout', '?')}s)\n"
-        append_to_log(md_path, f"Escalation Attempt {attempt} Execution Summary", exec_log)
-
-        # Verify
-        if attempt > escalation_retries:
-            print(f"\n[FAIL] Escalation max retries ({escalation_retries}) reached.")
-            append_to_log(md_path, "Escalation Final Result",
-                          f"{_S.ESCALATION_MODEL} FAILED after {escalation_retries} retries.")
-            print(f"\nLog: {md_path}")
-            return False
-
-        print(f"\n[5] Asking {_S.ESCALATION_MODEL} to verify output...")
-        current_prompt = build_verification_prompt(executed, prompt)
+        elif result["status"] == "continue":
+            if attempt > escalation_retries:
+                print(f"\n[FAIL] Escalation max retries ({escalation_retries}) reached.")
+                append_to_log(md_path, "Escalation Final Result",
+                              f"{model_label} FAILED after {escalation_retries} retries.")
+                print(f"\nLog: {md_path}")
+                return False
+            print(f"\n[5] Asking {model_label} to verify output...")
+            current_prompt = build_verification_prompt(result["executed"], prompt)
 
     print(f"\nLog: {md_path}")
     return False
@@ -1464,23 +1328,10 @@ def run_followup_pipeline(session, followup_prompt: str, md_path=None,
                           target: str = "local", max_retries: int = 3,
                           timeout: int = 30, remote_dir: str = None,
                           file_paths: list = None) -> bool:
-    """Run the extract → execute → verify loop on a follow-up prompt.
+    """Run the extract -> execute -> verify loop on a follow-up prompt.
 
-    This is for the workbench UI: after the initial pipeline finishes, the
-    user can send follow-up prompts in the same ChatGPT session. Each
-    follow-up goes through the full pipeline loop (extract code, execute,
-    verify) just like the initial prompt, but uses session.followup()
-    instead of session.prompt().
-
-    Args:
-        session: An already-open ChatGPTSession (same conversation).
-        followup_prompt: The user's new prompt text.
-        md_path: Path to the raw_md log to append to (or None).
-        target: 'local' or 'raspi'.
-        max_retries: Max retry attempts for this follow-up.
-        timeout: Default execution timeout.
-        remote_dir: Working directory on Pi.
-        file_paths: Optional file paths to attach.
+    For the workbench UI: after the initial pipeline finishes, the user
+    can send follow-up prompts in the same ChatGPT session.
 
     Returns True if the LLM verified PASS, False otherwise.
     """
@@ -1494,21 +1345,15 @@ def run_followup_pipeline(session, followup_prompt: str, md_path=None,
     print(f"  Retries: {max_retries}")
     print("=" * 60)
 
-    _saved_code_hashes = set()
-
-    # The first prompt in the follow-up is the user's new prompt.
-    # Subsequent prompts are verification/retry follow-ups.
+    saved_code_hashes = set()
     current_prompt = followup_prompt
     is_first = True
 
     for attempt in range(1, max_retries + 2):
         print(f"\n{'='*60}")
-        if is_first:
-            label = "FOLLOWUP"
-        elif attempt == 2:
-            label = "VERIFY 1"
-        else:
-            label = f"RETRY {attempt - 2}"
+        if is_first: label = "FOLLOWUP"
+        elif attempt == 2: label = "VERIFY 1"
+        else: label = f"RETRY {attempt - 2}"
         print(f"[{label}]")
         print(f"{'='*60}")
 
@@ -1526,147 +1371,28 @@ def run_followup_pipeline(session, followup_prompt: str, md_path=None,
         if md_path:
             append_to_log(md_path, f"Follow-up Response (Attempt {attempt})", response)
 
-        # Check for PASS
-        response_stripped = response.strip()
-        if response_stripped.upper().startswith("PASS"):
-            print(f"\n[DONE] LLM verified: PASS")
-            if md_path:
-                append_to_log(md_path, f"Follow-up Attempt {attempt} Result",
-                              "LLM VERIFIED: PASS")
+        result = _extract_execute_verify(
+            response=response, session=session, prompt_label="Follow-up",
+            task_prompt=followup_prompt, target=resolved, timeout=timeout,
+            remote_dir=remote_dir, detach=detach, attempt=attempt,
+            md_path=md_path, saved_code_hashes=saved_code_hashes,
+            no_code_ok=True,  # Follow-ups may be text-only answers
+        )
+
+        if result["status"] == "pass":
             return True
-
-        # Handle installs
-        handle_installs(response, resolved)
-
-        # Timeout hint
-        timeout_hint = extract_timeout_hint(response)
-        run_timeout = timeout_hint or timeout
-        if timeout_hint:
-            print(f"  [TIMEOUT] LLM says {timeout_hint}s needed")
-
-        # Observe hint (for long-running processes)
-        observe_hint = extract_observe_hint(response)
-        if observe_hint:
-            print(f"  [OBSERVE] LLM says observe output for {observe_hint}s")
-
-        # Extract code
-        print(f"\n[3] Extracting code from response...")
-        blocks = extract_blocks(response)
-        if not blocks:
-            print("  [WARN] No code blocks found in follow-up response.")
-            if md_path:
-                append_to_log(md_path, f"Follow-up Attempt {attempt}",
-                              "No code blocks found.")
-            # If the LLM just gave a text answer with no code, that's fine —
-            # it may be answering a question. Don't retry, just return.
-            print("  [INFO] LLM responded without code (may be a text answer).")
-            return True
-
-        scripts, commands = classify_blocks(blocks)
-        print(f"  Found: {len(scripts)} script(s), {len(commands)} command(s)")
-
-        # Deduplicate
-        if scripts:
-            unique_scripts = []
-            for block in scripts:
-                code_hash = hash(block.code.strip())
-                if code_hash in _saved_code_hashes:
-                    print(f"  [SKIP] Duplicate script detected, skipping.")
-                else:
-                    unique_scripts.append(block)
-                    _saved_code_hashes.add(code_hash)
-            scripts = unique_scripts
-
-        if not scripts and not commands:
-            print("  [WARN] No executable code after classification.")
-            current_prompt = (
-                "Your response contained code but none were executable "
-                "scripts or commands. Please provide a complete script."
-            )
+        elif result["status"] in ("no_code", "no_exec"):
+            current_prompt = result["next_prompt"]
             continue
-
-        # Execute
-        print(f"\n[4] Executing on {resolved}...")
-        all_results = []
-        pre_snap = snapshot_dirs()
-
-        if commands:
-            if resolved == "raspi":
-                cmd_results = run_commands_on_pi(commands, timeout=15)
-                all_results.extend(cmd_results)
-            else:
-                print(f"  [SKIP] {len(commands)} shell command(s) -- local runs Python only")
-
-        if scripts:
-            saved_files = []
-            for i, block in enumerate(scripts):
-                fp = save_script(block, followup_prompt, response, i, len(scripts), attempt)
-                saved_files.append((fp, block))
-
-            for fp, block in saved_files:
+        elif result["status"] == "continue":
+            if attempt > max_retries:
+                print(f"\n[FAIL] Max retries ({max_retries}) reached.")
                 if md_path:
-                    append_to_log(md_path, f"Saved Script: {fp.name} (Follow-up {attempt})",
-                                  f"```{block.language}\n{block.code}\n```")
-
-                # Determine execution mode
-                effective_observe = observe_hint
-                if not effective_observe and needs_observation(block.code):
-                    effective_observe = _AUTO_OBSERVE_SECONDS
-                    print(f"  [AUTO-OBSERVE] Script spawns child processes, "
-                          f"auto-enabling observation for {effective_observe}s")
-
-                if resolved == "raspi":
-                    result = run_script_on_pi(fp, remote_dir or REMOTE_WORK_DIR,
-                                              timeout=run_timeout, detach=detach)
-                elif effective_observe:
-                    result = run_script_local_observed(
-                        fp, timeout=run_timeout, observe_seconds=effective_observe)
-                else:
-                    result = run_script_local(fp, timeout=run_timeout)
-                all_results.append(result)
-
-        executed = [r for r in all_results if not r.get("skipped")]
-        for r in executed:
-            out_path = save_output(r.get("name", "output"), r.get("stdout", ""),
-                                   r.get("stderr", ""), attempt)
-            if md_path:
-                out_content = ""
-                if r.get("stdout"):
-                    out_content += f"STDOUT:\n```\n{r['stdout'][:3000]}\n```\n"
-                if r.get("stderr"):
-                    out_content += f"STDERR:\n```\n{r['stderr'][:2000]}\n```\n"
-                if not out_content:
-                    out_content = "(no output)\n"
-                append_to_log(md_path, f"Output: {out_path.name} (Follow-up {attempt})",
-                              out_content)
-
-        if not executed:
-            print("\n  [WARN] Nothing executed.")
-            current_prompt = "None of the code was executable. Please provide a runnable Python script."
-            continue
-
-        if resolved == "local":
-            sweep_artifacts(pre_snap)
-
-        # Log execution summary
-        exec_log = ""
-        for r in executed:
-            exec_log += f"**{r.get('name', '?')}**: exit code {r['exit_code']}\n"
-            if r.get("timed_out"):
-                exec_log += f"(Timed out after {r.get('timeout', '?')}s)\n"
-        if md_path:
-            append_to_log(md_path, f"Follow-up {attempt} Execution Summary", exec_log)
-
-        # Verify
-        if attempt > max_retries:
-            print(f"\n[FAIL] Max retries ({max_retries}) reached.")
-            if md_path:
-                append_to_log(md_path, "Follow-up Final Result",
-                              f"FAILED after {max_retries} retries.")
-            return False
-
-        print(f"\n[5] Asking ChatGPT to verify output...")
-        current_prompt = build_verification_prompt(executed, followup_prompt)
+                    append_to_log(md_path, "Follow-up Final Result",
+                                  f"FAILED after {max_retries} retries.")
+                return False
+            print(f"\n[5] Asking ChatGPT to verify output...")
+            current_prompt = build_verification_prompt(result["executed"], followup_prompt)
 
     return False
 
